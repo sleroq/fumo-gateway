@@ -13,6 +13,12 @@ pub fn login(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !v
     try auth.run(directory);
 }
 
+pub fn refresh(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !void {
+    var auth: Refresh = .{ .http = .{ .allocator = allocator, .io = io } };
+    defer auth.http.deinit();
+    try auth.run(directory);
+}
+
 /// SIWC only, following CLIProxyAPI's siwc_auth.go and siwc_bind.go.
 /// Origin, port, and deadline injection are for local tests, not CLI options.
 pub const Login = struct {
@@ -37,7 +43,7 @@ pub const Login = struct {
         // Persistence is the commit, outside the authorization deadline. Neither
         // timeout cancellation nor a broken confirmation pipe can undo success.
         try storage.save(self.http.allocator, io, directory, credentials);
-        showSuccess(io) catch {};
+        showSuccess(io, "SIWC credentials saved.\n") catch {};
     }
 
     fn authorizeWithDeadline(self: *Login, allocator: std.mem.Allocator, callback: *Callback, authorization: Authorization, redirect_uri: []const u8) !storage.Credentials {
@@ -71,36 +77,92 @@ pub const Login = struct {
             .{ .name = "redirect_uri", .value = redirect_uri },
             .{ .name = "resource", .value = resource },
         });
-        const reply = try self.requestTokens(allocator, body);
+        const reply = try postTokens(&self.http, self.origin, allocator, body);
+        if (reply.status != .ok) return error.TokenExchangeFailed;
         const now: i64 = @intCast(std.Io.Clock.real.now(self.http.io).toSeconds());
-        return parseCredentials(allocator, reply, grant.client_id, &authorization.device_id, now);
-    }
-
-    /// Never follow redirects or log response bodies: both sides contain secrets.
-    fn requestTokens(self: *Login, allocator: std.mem.Allocator, body: []u8) ![]u8 {
-        const url = try std.fmt.allocPrint(allocator, "{s}/api/accounts/oauth/token", .{self.origin});
-        var request = try self.http.request(.POST, try std.Uri.parse(url), .{
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-            .headers = .{
-                .authorization = .omit,
-                .user_agent = .omit,
-                .content_type = .{ .override = "application/x-www-form-urlencoded" },
-                .accept_encoding = .{ .override = "identity" },
-            },
-            .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
-        });
-        defer request.deinit();
-        try request.sendBodyComplete(body);
-        var response = try request.receiveHead(&.{});
-        while (response.head.status.class() == .informational) {
-            if (response.head.status == .switching_protocols) return error.UnsupportedUpgrade;
-            response = try request.receiveHead(&.{});
-        }
-        if (response.head.status != .ok) return error.TokenExchangeFailed;
-        return response.reader(&.{}).allocRemaining(allocator, .limited(1024 * 1024));
+        return parseCredentials(allocator, reply.body, grant.client_id, &authorization.device_id, now, null);
     }
 };
+
+/// One explicit refresh, without retries. Automatic inference-time refresh and
+/// coordination belong to the future running credential owner, not this command.
+pub const Refresh = struct {
+    http: std.http.Client,
+    origin: []const u8 = auth_origin,
+    timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(30), .clock = .awake },
+
+    pub fn run(self: *Refresh, directory: []const u8) !void {
+        var current = try storage.load(self.http.allocator, self.http.io, directory);
+        defer current.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.http.allocator);
+        defer arena.deinit();
+        const credentials = try self.refreshWithDeadline(arena.allocator(), current.value);
+        // Saving is the commit, outside the network deadline, just as for login.
+        try storage.save(self.http.allocator, self.http.io, directory, credentials);
+        showSuccess(self.http.io, "SIWC credentials refreshed.\n") catch {};
+    }
+
+    fn refreshWithDeadline(self: *Refresh, allocator: std.mem.Allocator, current: storage.Credentials) !storage.Credentials {
+        const io = self.http.io;
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, self.timeout);
+        var completed: std.Io.Semaphore = .{};
+        var task = try io.concurrent(request, .{ self, allocator, current, &completed });
+        defer {
+            if (task.cancel(io)) |_| {} else |_| {}
+        }
+        completed.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.Timeout => return error.RefreshTimedOut,
+            else => return err,
+        };
+        return try task.await(io);
+    }
+
+    fn request(self: *Refresh, allocator: std.mem.Allocator, current: storage.Credentials, completed: *std.Io.Semaphore) !storage.Credentials {
+        defer completed.post(self.http.io);
+        const body = try encodeParameters(allocator, &.{
+            .{ .name = "grant_type", .value = "refresh_token" },
+            .{ .name = "client_id", .value = current.client_id },
+            .{ .name = "refresh_token", .value = current.refresh_token },
+            .{ .name = "resource", .value = resource },
+        });
+        const reply = try postTokens(&self.http, self.origin, allocator, body);
+        if (reply.status != .ok) {
+            const failure = std.json.parseFromSliceLeaky(struct { @"error": []const u8 = "" }, allocator, reply.body, .{ .ignore_unknown_fields = true }) catch return error.TokenRefreshFailed;
+            if (std.mem.eql(u8, failure.@"error", "invalid_grant")) return error.ReauthenticationRequired;
+            return error.TokenRefreshFailed;
+        }
+        const now: i64 = @intCast(std.Io.Clock.real.now(self.http.io).toSeconds());
+        return parseCredentials(allocator, reply.body, current.client_id, current.device_id, now, current.id_token);
+    }
+};
+
+const TokenReply = struct { status: std.http.Status, body: []u8 };
+
+/// Login and refresh share the SIWC endpoint, limits, and redirect policy.
+/// Neither request nor response bodies may appear in diagnostics.
+fn postTokens(http: *std.http.Client, origin: []const u8, allocator: std.mem.Allocator, body: []u8) !TokenReply {
+    const url = try std.fmt.allocPrint(allocator, "{s}/api/accounts/oauth/token", .{origin});
+    var request = try http.request(.POST, try std.Uri.parse(url), .{
+        .keep_alive = false,
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = .omit,
+            .user_agent = .omit,
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+    });
+    defer request.deinit();
+    try request.sendBodyComplete(body);
+    var response = try request.receiveHead(&.{});
+    while (response.head.status.class() == .informational) {
+        if (response.head.status == .switching_protocols) return error.UnsupportedUpgrade;
+        response = try request.receiveHead(&.{});
+    }
+    const status = response.head.status;
+    return .{ .status = status, .body = try response.reader(&.{}).allocRemaining(allocator, .limited(1024 * 1024)) };
+}
 
 const Authorization = struct {
     state: [43]u8,
@@ -169,19 +231,21 @@ fn deviceId(io: std.Io) ![36]u8 {
     return uuid;
 }
 
-fn parseCredentials(allocator: std.mem.Allocator, body: []const u8, client_id: []const u8, device_id: []const u8, now: i64) !storage.Credentials {
+fn parseCredentials(allocator: std.mem.Allocator, body: []const u8, client_id: []const u8, device_id: []const u8, now: i64, previous_id_token: ?[]const u8) !storage.Credentials {
     // Match CLIProxyAPI's SIWC contract: ID tokens are opaque credentials from the
     // HTTPS token endpoint, not locally verified identities or gateway client keys.
-    const Tokens = struct { access_token: []const u8, refresh_token: []const u8, id_token: []const u8, scope: []const u8, expires_in: std.json.Value };
+    const Tokens = struct { access_token: []const u8, refresh_token: []const u8, id_token: ?[]const u8 = null, scope: []const u8, expires_in: std.json.Value };
     const tokens = try std.json.parseFromSliceLeaky(Tokens, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     const expires_in = switch (tokens.expires_in) {
         .integer => |seconds| if (seconds > 0) seconds else return error.InvalidTokenExpiry,
         else => return error.InvalidTokenExpiry,
     };
+    const received_id = tokens.id_token orelse "";
+    const id_token = if (std.mem.trim(u8, received_id, " \t\r\n\x0b\x0c").len != 0) received_id else previous_id_token orelse return error.InvalidCredentials;
     const credentials: storage.Credentials = .{
         .access_token = tokens.access_token,
         .refresh_token = tokens.refresh_token,
-        .id_token = tokens.id_token,
+        .id_token = try allocator.dupe(u8, id_token),
         .scope = tokens.scope,
         .client_id = try allocator.dupe(u8, client_id),
         .device_id = try allocator.dupe(u8, device_id),
@@ -199,10 +263,10 @@ fn showAuthorization(io: std.Io, url: []const u8) !void {
     try output.interface.flush();
 }
 
-fn showSuccess(io: std.Io) !void {
+fn showSuccess(io: std.Io, message: []const u8) !void {
     var buffer: [256]u8 = undefined;
     var output = std.Io.File.stdout().writer(io, &buffer);
-    try output.interface.writeAll("SIWC credentials saved.\n");
+    try output.interface.writeAll(message);
     try output.interface.flush();
 }
 
@@ -224,4 +288,30 @@ test "form fields are escaped without losing reserved characters" {
     const body = try encodeParameters(std.testing.allocator, &.{.{ .name = "code", .value = "a +/&=?%" }});
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings("code=a%20%2B%2F%26%3D%3F%25", body);
+}
+
+test "only refresh may preserve a previous ID token and owns the preserved value" {
+    const body = "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":3600}";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.InvalidCredentials, parseCredentials(allocator, body, "client", "device", 100, null));
+    const credentials = blk: {
+        const previous_id = try std.testing.allocator.dupe(u8, "previous-id");
+        defer std.testing.allocator.free(previous_id);
+        break :blk try parseCredentials(allocator, body, "client", "device", 100, previous_id);
+    };
+    try std.testing.expectEqualStrings("previous-id", credentials.id_token);
+    try std.testing.expectEqualStrings("new-refresh", credentials.refresh_token);
+    try std.testing.expectEqual(3700, credentials.expires_at);
+}
+
+test "token expiry must be a positive JSON integer without timestamp overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_][]const u8{ "\"3600\"", "null", "true", "3600.5", "0", "-1", "9223372036854775807" }) |expiry| {
+        const body = try std.fmt.allocPrint(allocator, "{{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"id_token\":\"id\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":{s}}}", .{expiry});
+        try std.testing.expectError(error.InvalidTokenExpiry, parseCredentials(allocator, body, "client", "device", 100, null));
+    }
 }
