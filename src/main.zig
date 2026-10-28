@@ -19,7 +19,7 @@ fn run(init: std.process.Init) !void {
 
     var config = try Config.load(init.gpa, init.io, args[2], init.environ_map);
     defer config.deinit();
-    try server.serve(init.io, &config);
+    try server.serve(init.gpa, init.io, &config);
 }
 
 test {

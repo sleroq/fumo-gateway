@@ -1,5 +1,9 @@
 {
   "listen": "127.0.0.1:8080",
+  "upstream": {
+    "url": "http://127.0.0.1:9090/v1/responses",
+    "models": {"demo": "fixture-model"}
+  },
   "clients": {
     "pi": {
       "key_env": "FUMO_PI_KEY"

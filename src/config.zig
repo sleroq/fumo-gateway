@@ -1,7 +1,26 @@
 const std = @import("std");
 const auth = @import("auth.zig");
 
+pub const Upstream = struct {
+    url: []const u8,
+    models: std.json.ArrayHashMap([]const u8),
+
+    fn validate(self: Upstream) !void {
+        const uri = std.Uri.parse(self.url) catch return error.InvalidUpstreamUrl;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidUpstreamUrl;
+        const host = uri.host orelse return error.InvalidUpstreamUrl;
+        if (host.isEmpty() or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidUpstreamUrl;
+        if (uri.port == 0) return error.InvalidUpstreamUrl;
+        if (self.models.map.count() == 0) return error.NoUpstreamModels;
+        for (self.models.map.keys(), self.models.map.values()) |alias, model| {
+            if (alias.len == 0) return error.EmptyModelAlias;
+            if (model.len == 0) return error.EmptyUpstreamModel;
+        }
+    }
+};
+
 const Document = struct {
+    upstream: ?Upstream = null,
     listen: []const u8 = "127.0.0.1:8080",
     clients: std.json.ArrayHashMap(struct { key_env: []const u8 }),
 };
@@ -10,6 +29,7 @@ pub const Config = struct {
     arena: std.heap.ArenaAllocator,
     address: std.Io.net.IpAddress,
     clients: []const auth.Client,
+    upstream: ?Upstream,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, environ: *const std.process.Environ.Map) !Config {
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024));
@@ -23,6 +43,7 @@ pub const Config = struct {
         const allocator = arena.allocator();
 
         const document = try std.json.parseFromSliceLeaky(Document, allocator, text, .{ .allocate = .alloc_always });
+        if (document.upstream) |upstream| try upstream.validate();
         const address = std.Io.net.IpAddress.parseLiteral(document.listen) catch return error.InvalidListenAddress;
         if (address.getPort() == 0) return error.InvalidListenAddress;
         if (document.clients.map.count() == 0) return error.NoClients;
@@ -44,7 +65,7 @@ pub const Config = struct {
             }
         }
 
-        return .{ .arena = arena, .address = address, .clients = clients };
+        return .{ .arena = arena, .address = address, .clients = clients, .upstream = document.upstream };
     }
 
     pub fn deinit(self: *Config) void {
@@ -66,6 +87,7 @@ test "configuration resolves environment keys and defaults to loopback" {
     try std.testing.expectEqualStrings("dev", auth.authenticate(config.clients, "Bearer second-secret").?);
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, config.address.ip4.bytes);
     try std.testing.expectEqual(8080, config.address.getPort());
+    try std.testing.expect(config.upstream == null);
 }
 
 test "invalid configuration fails before serving" {
@@ -90,4 +112,52 @@ test "invalid configuration fails before serving" {
     try std.testing.expectError(error.UnknownField, Config.parse(std.testing.allocator,
         \\{"unknown":true,"clients":{"pi":{"key_env":"PI_KEY"}}}
     , &environ));
+}
+
+test "upstream preserves endpoint and model aliases in its arena" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("PI_KEY", "secret");
+    const text = try std.testing.allocator.dupe(u8,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"http://127.0.0.1:9090/v1/responses","models":{"demo":"fixture-model","other":"second-model"}}}
+    );
+    var config = try Config.parse(std.testing.allocator, text, &environ);
+    defer config.deinit();
+    std.testing.allocator.free(text);
+    const upstream = config.upstream.?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:9090/v1/responses", upstream.url);
+    try std.testing.expectEqualStrings("fixture-model", upstream.models.map.get("demo").?);
+    try std.testing.expectEqualStrings("second-model", upstream.models.map.get("other").?);
+}
+
+test "invalid upstream configuration is rejected" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("PI_KEY", "secret");
+    const invalid_urls = [_][]const u8{
+        "",                                              "/v1/responses",                         "ftp://example.com/v1/responses",
+        "http:///v1/responses",                          "http://:9090/v1/responses",             "http://user@example.com/v1/responses",
+        "http://user:password@example.com/v1/responses", "http://example.com/v1/responses?",      "http://example.com/v1/responses#",
+        "http://example.com:0/v1/responses",             "http://example.com:65536/v1/responses", "http://example.com:bad/v1/responses",
+        "http://example.com:/v1/responses",
+    };
+    for (invalid_urls) |url| {
+        const text = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"{s}","models":{{"demo":"model"}}}}}}
+        , .{url});
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(error.InvalidUpstreamUrl, Config.parse(std.testing.allocator, text, &environ));
+    }
+    const cases = .{
+        .{ "{}", error.NoUpstreamModels },
+        .{ "{\"\":\"model\"}", error.EmptyModelAlias },
+        .{ "{\"demo\":\"\"}", error.EmptyUpstreamModel },
+    };
+    inline for (cases) |case| {
+        const text = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"https://example.com/v1/responses","models":{s}}}}}
+        , .{case[0]});
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(case[1], Config.parse(std.testing.allocator, text, &environ));
+    }
 }
