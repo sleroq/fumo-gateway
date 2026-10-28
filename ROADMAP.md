@@ -40,3 +40,8 @@ Universal protocol translation, WebSockets, automatic model-family guessing, acc
 
 - ChatGPT auth and sse streaming - https://github.com/router-for-me/CLIProxyAPI
 - Opencode Go - https://github.com/massiveits/opencode-go-cliproxyapi
+
+## Current limitations
+
+- Concurrency is implemented via worker threads and std.Id.Threaded. With SSE this will likely cause a lot of workers to be waiting for idle SSE connections and needs to be fixed in the future
+- WebSockets would be cool to have for codex but it's probably very complex
