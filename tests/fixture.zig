@@ -38,7 +38,7 @@ pub const Fixture = struct {
     }
 
     pub fn origin(self: *const Fixture, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator, "http://{f}", .{self.listener.socket.address});
+        return allocator.print("http://{f}", .{self.listener.socket.address});
     }
 
     fn check(self: *Fixture) !void {

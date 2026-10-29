@@ -155,15 +155,18 @@ pub const Refresh = struct {
         const io = self.http.io;
         const deadline = std.Io.Clock.Timestamp.fromNow(io, self.timeout);
         var completed: std.Io.Semaphore = .{};
+
         var task = try io.concurrent(request, .{ self, arena_allocator, current, &completed });
         defer {
             if (task.cancel(io)) |_| {} else |_| {}
         }
+
         completed.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
             error.Timeout => return error.RefreshTimedOut,
             else => return err,
         };
         return try task.await(io);
+
     }
 
     /// allocator is the exchange caller's arena for credentials and intermediates.
@@ -175,10 +178,12 @@ pub const Refresh = struct {
             .{ .name = "refresh_token", .value = current.refresh_token },
             .{ .name = "resource", .value = resource },
         });
+
         const reply = try postTokens(&self.http, self.origin, allocator, body);
         if (reply.status != .ok) {
             return refreshError(tokenError(allocator, reply.body));
         }
+
         const now: i64 = @intCast(std.Io.Clock.real.now(self.http.io).toSeconds());
         return parseCredentials(allocator, reply.body, current.client_id, current.device_id, now, current.id_token);
     }
@@ -204,7 +209,7 @@ const TokenReply = struct { status: std.http.Status, body: []u8 };
 /// arena_allocator must be arena-backed; the URL and response body are left
 /// for caller-owned bulk reclamation, including on error.
 fn postTokens(http: *std.http.Client, origin: []const u8, arena_allocator: std.mem.Allocator, body: []u8) !TokenReply {
-    const url = try std.fmt.allocPrint(arena_allocator, "{s}/api/accounts/oauth/token", .{origin});
+    const url = try arena_allocator.print("{s}/api/accounts/oauth/token", .{origin});
     var request = try http.request(.POST, try std.Uri.parse(url), .{
         .keep_alive = false,
         .redirect_behavior = .unhandled,
@@ -261,10 +266,13 @@ const Authorization = struct {
     fn url(self: *const Authorization, allocator: std.mem.Allocator, origin: []const u8, redirect_uri: []const u8) ![]u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&self.verifier, &digest, .{});
+
         var challenge: [43]u8 = undefined;
         _ = std.base64.url_safe_no_pad.Encoder.encode(&challenge, &digest);
-        const host_id = try std.fmt.allocPrint(allocator, "urn:uuid:{s}", .{self.device_id});
+
+        const host_id = try allocator.print("urn:uuid:{s}", .{self.device_id});
         defer allocator.free(host_id);
+
         const query = try encodeParameters(allocator, &.{
             .{ .name = "client_id", .value = self.client_id orelse "dynamic_agent_client" },
             .{ .name = "ext_agent_host_id", .value = host_id },
@@ -278,7 +286,8 @@ const Authorization = struct {
             .{ .name = "code_challenge_method", .value = "S256" },
         });
         defer allocator.free(query);
-        return std.fmt.allocPrint(allocator, "{s}/api/accounts/authorize?{s}{s}", .{ origin, query, if (self.client_id == null) "&agent_name_hint=fumo-gateway" else "" });
+
+        return allocator.print("{s}/api/accounts/authorize?{s}{s}", .{ origin, query, if (self.client_id == null) "&agent_name_hint=fumo-gateway" else "" });
     }
 };
 
@@ -310,7 +319,7 @@ fn deviceId(io: std.Io) ![36]u8 {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const hex = std.fmt.bytesToHex(bytes, .lower);
     var uuid: [36]u8 = undefined;
-    _ = std.fmt.bufPrint(&uuid, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..] }) catch unreachable;
+    _ = std.mem.print(&uuid, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..] }) catch unreachable;
     return uuid;
 }
 
@@ -413,7 +422,7 @@ test "token expiry must be a positive JSON integer without timestamp overflow" {
     defer arena.deinit();
     const allocator = arena.allocator();
     for ([_][]const u8{ "\"3600\"", "null", "true", "3600.5", "0", "-1", "9223372036854775807" }) |expiry| {
-        const body = try std.fmt.allocPrint(allocator, "{{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"id_token\":\"id\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":{s}}}", .{expiry});
+        const body = try allocator.print("{{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"id_token\":\"id\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":{s}}}", .{expiry});
         try std.testing.expectError(error.InvalidTokenExpiry, parseCredentials(allocator, body, "client", "device", 100, null));
     }
 }
@@ -434,13 +443,13 @@ const auth_test_current: storage.Credentials = .{
 };
 
 fn authTestReply(allocator: std.mem.Allocator, status: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, body.len, body });
+    return allocator.print("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, body.len, body });
 }
 
 fn authTestCallback(io: std.Io, uri: []const u8, state: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const url = try std.fmt.allocPrint(arena.allocator(), "{s}?state={s}&code=code%20%2B%2F%26%3D%3F%25&client_id=issued-client", .{ uri, state });
+    const url = try arena.allocator().print("{s}?state={s}&code=code%20%2B%2F%26%3D%3F%25&client_id=issued-client", .{ uri, state });
     var http: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
     defer http.deinit();
     var request = try http.request(.GET, try std.Uri.parse(url), .{ .keep_alive = false });
@@ -568,7 +577,7 @@ test "failed code exchange retains new registration but never replaces an active
 fn authTestRequest(raw: []const u8, body: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, raw, "POST /api/accounts/oauth/token HTTP/1.1\r\n"));
     try std.testing.expect(std.ascii.findIgnoreCase(raw, "content-type: application/x-www-form-urlencoded\r\n") != null);
-    const start = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+    const start = (std.mem.find(u8, raw, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
     try std.testing.expectEqualStrings(body, raw[start..]);
 }
 
@@ -617,7 +626,7 @@ test "refresh rotates credentials and preserves bytes on HTTP parse and timeout 
             defer saved.deinit();
             try std.testing.expectEqualStrings("new-access", saved.value.access_token);
             try std.testing.expectEqualStrings("new-refresh", saved.value.refresh_token);
-            try std.testing.expectEqualStrings(if (std.mem.indexOf(u8, case.body, "id_token") != null) "new-id" else "old-id", saved.value.id_token);
+            try std.testing.expectEqualStrings(if (std.mem.find(u8, case.body, "id_token") != null) "new-id" else "old-id", saved.value.id_token);
             try std.testing.expectEqualStrings(auth_test_current.client_id, saved.value.client_id);
             try std.testing.expectEqualStrings(auth_test_current.device_id, saved.value.device_id);
             try std.testing.expectEqual(@as(i64, 1234), saved.value.expires_at - saved.value.obtained_at);

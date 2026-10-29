@@ -23,7 +23,7 @@ pub const Callback = struct {
     }
 
     pub fn redirectUri(self: *const Callback, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/auth/callback", .{self.server.socket.address.getPort()});
+        return allocator.print("http://127.0.0.1:{d}/auth/callback", .{self.server.socket.address.getPort()});
     }
 
     /// The caller owns the deadline and must deinit the listener after waiting.
@@ -100,17 +100,17 @@ fn respond(request: *std.http.Server.Request, writer: *std.Io.net.Stream.Writer,
 }
 
 fn parse(allocator: std.mem.Allocator, method: std.http.Method, target: []const u8, expected_state: []const u8, expected_client: ?[]const u8) !Grant {
-    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    const query_start = std.mem.findScalar(u8, target, '?') orelse target.len;
     if (!std.mem.eql(u8, target[0..query_start], "/auth/callback")) return error.NotFound;
     if (method != .GET) return error.MethodNotAllowed;
-    if (query_start == target.len or std.mem.indexOfScalar(u8, target, '#') != null) return error.InvalidQuery;
+    if (query_start == target.len or std.mem.findScalar(u8, target, '#') != null) return error.InvalidQuery;
 
     var fields: [4]?[]const u8 = .{ null, null, null, null };
     const names = [_][]const u8{ "state", "code", "client_id", "error" };
     var pairs = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
 
     while (pairs.next()) |pair| {
-        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse return error.InvalidQuery;
+        const equals = std.mem.findScalar(u8, pair, '=') orelse return error.InvalidQuery;
         const name = try decode(allocator, pair[0..equals]);
         const value = try decode(allocator, pair[equals + 1 ..]);
         for (names, 0..) |known, i| {
@@ -179,7 +179,7 @@ test "state, required client, duplicates, malformed queries and fragments are re
         "state=&code=c&client_id=i",          "state=s&code=c&client_id=+",          "state=s&code=%20&client_id=i",
     };
     for (invalid) |query| {
-        const target = try std.fmt.allocPrint(a, "/auth/callback?{s}", .{query});
+        const target = try a.print("/auth/callback?{s}", .{query});
         try std.testing.expectError(error.InvalidQuery, parse(a, .GET, target, "s", null));
     }
     try std.testing.expectError(error.NotFound, parse(a, .GET, "/favicon.ico", "s", null));

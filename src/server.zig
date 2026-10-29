@@ -375,7 +375,7 @@ test "transport socket relay preserves payload, isolates headers, and handles re
         try fixture.start();
         const origin = try fixture.origin(T.allocator);
         defer T.allocator.free(origin);
-        const url = try std.fmt.allocPrint(T.allocator, "{s}/v1/responses", .{origin});
+        const url = try T.allocator.print("{s}/v1/responses", .{origin});
         defer T.allocator.free(url);
         var upstream: @import("config.zig").Upstream = .{ .url = url, .models = .{} };
         defer upstream.models.deinit(T.allocator);
@@ -733,7 +733,7 @@ test "transport SIWC validates caller auth, JSON, and model aliases locally" {
         .{ "transport-secret", "{\"model\":\"unknown\"}", "400 Bad Request", "unknown_model" },
     };
     inline for (cases) |case| {
-        const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ case[0], case[1].len, case[1] });
+        const raw = try a.print("POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ case[0], case[1].len, case[1] });
         defer a.free(raw);
         var reader = std.Io.Reader.fixed(raw);
         var writer: std.Io.Writer.Allocating = .init(a);

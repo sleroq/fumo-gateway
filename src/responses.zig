@@ -287,7 +287,7 @@ test "transport cancellation during upstream upload discards the incomplete conn
     const io = std.testing.io;
     var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
     defer listener.deinit(io);
-    const origin = try std.fmt.allocPrint(a, "http://{f}", .{listener.socket.address});
+    const origin = try a.print("http://{f}", .{listener.socket.address});
     defer a.free(origin);
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
@@ -361,7 +361,7 @@ test "transport preparation releases scratch before pending data is used" {
         .{ .body = "{\"model\":\"unknown\",\"stream\":true}", .err = error.UnknownModel },
     };
     for (cases) |case| {
-        const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nSession_id: session\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.body.len, case.body });
+        const raw = try a.print("POST /v1/responses HTTP/1.1\r\nSession_id: session\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.body.len, case.body });
         defer a.free(raw);
         var reader = std.Io.Reader.fixed(raw);
         var writer: std.Io.Writer.Discarding = .init(&.{});
@@ -411,14 +411,14 @@ test "transport SIWC fixture preserves native fields, client Accept, and stream 
     try fixture.start();
     const origin = try fixture.origin(a);
     defer a.free(origin);
-    const url = try std.fmt.allocPrint(a, "{s}/v1/responses", .{origin});
+    const url = try a.print("{s}/v1/responses", .{origin});
     defer a.free(url);
     // Exercise preparation against loopback, without adding a production
     // endpoint override. Provider.init separately proves pinning is mandatory.
     var upstream: Upstream = .{ .url = url, .models = .{}, .auth = .{ .provider = .codex } };
     defer upstream.models.deinit(a);
     try upstream.models.map.put(a, "demo", "fixture-model");
-    const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer gateway-secret\r\nCookie: private\r\nProxy-Authorization: private\r\nX-Api-Key: private\r\nAccept: application/json\r\nUser-Agent: private\r\nSession_id: session_1\r\nX-Request-Id: private\r\nConnection: x-request-id\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
+    const raw = try a.print("POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer gateway-secret\r\nCookie: private\r\nProxy-Authorization: private\r\nX-Api-Key: private\r\nAccept: application/json\r\nUser-Agent: private\r\nSession_id: session_1\r\nX-Request-Id: private\r\nConnection: x-request-id\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
     defer a.free(raw);
     var reader = std.Io.Reader.fixed(raw);
     var writer: std.Io.Writer.Allocating = .init(a);

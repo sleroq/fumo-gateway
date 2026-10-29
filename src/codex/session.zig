@@ -41,7 +41,7 @@ pub const Session = struct {
         if (needsRefresh(self.current.value.expires_at, now, self.options.refresh_lead_seconds))
             self.startRefresh();
         if (self.current.value.expires_at <= now) return error.CredentialsUnavailable;
-        return std.fmt.allocPrint(request_allocator, "Bearer {s}", .{self.current.value.access_token});
+        return request_allocator.print("Bearer {s}", .{self.current.value.access_token});
     }
 
     pub fn deinit(self: *Session) void {

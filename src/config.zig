@@ -133,7 +133,7 @@ test "SIWC configuration resolves private storage and pins the credential destin
     defer configured.deinit();
     try std.testing.expectEqualStrings("/private/credentials", configured.upstream.?.auth.?.credentials_dir.?);
     for ([_][]const u8{ "http://api.openai.com/v1/responses", "https://example.com/v1/responses", "https://api.openai.com/other", "https://api.openai.com:443/v1/responses" }) |url| {
-        const text = try std.fmt.allocPrint(std.testing.allocator,
+        const text = try std.testing.allocator.print(
             \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"{s}","models":{{"demo":"model"}},"auth":{{"provider":"codex"}}}}}}
         , .{url});
         defer std.testing.allocator.free(text);
@@ -156,7 +156,7 @@ test "invalid upstream configuration is rejected" {
         "http://example.com:/v1/responses",
     };
     for (invalid_urls) |url| {
-        const text = try std.fmt.allocPrint(std.testing.allocator,
+        const text = try std.testing.allocator.print(
             \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"{s}","models":{{"demo":"model"}}}}}}
         , .{url});
         defer std.testing.allocator.free(text);
@@ -168,7 +168,7 @@ test "invalid upstream configuration is rejected" {
         .{ "{\"demo\":\"\"}", error.EmptyUpstreamModel },
     };
     inline for (cases) |case| {
-        const text = try std.fmt.allocPrint(std.testing.allocator,
+        const text = try std.testing.allocator.print(
             \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"https://example.com/v1/responses","models":{s}}}}}
         , .{case[0]});
         defer std.testing.allocator.free(text);

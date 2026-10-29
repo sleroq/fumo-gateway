@@ -24,7 +24,7 @@ const Storage = struct {
         const path = try tmp.dir.realPathFileAlloc(io, ".", a);
         errdefer a.free(path);
         const now: i64 = @intCast(std.Io.Clock.real.now(io).toSeconds());
-        const json = try std.fmt.allocPrint(a, "{{\"access_token\":\"old-access\",\"refresh_token\":\"old-refresh\",\"id_token\":\"old-id\",\"client_id\":\"client\",\"device_id\":\"device\",\"scope\":\"chatgpt.tokens.use.direct\",\"obtained_at\":{d},\"expires_at\":{d}}}", .{ now - 3600, now + lifetime });
+        const json = try a.print("{{\"access_token\":\"old-access\",\"refresh_token\":\"old-refresh\",\"id_token\":\"old-id\",\"client_id\":\"client\",\"device_id\":\"device\",\"scope\":\"chatgpt.tokens.use.direct\",\"obtained_at\":{d},\"expires_at\":{d}}}", .{ now - 3600, now + lifetime });
         defer a.free(json);
         const file = try tmp.dir.createFile(io, "codex.json", .{ .permissions = .fromMode(0o600) });
         defer file.close(io);
@@ -116,8 +116,8 @@ test "session concurrent near-expiry requests are nonblocking singleflight and o
     try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
     const raw = fixture.requests[0].?;
     try std.testing.expect(std.mem.startsWith(u8, raw, "POST /api/accounts/oauth/token HTTP/1.1\r\n"));
-    try std.testing.expect(std.mem.indexOf(u8, raw, "refresh_token=old-refresh") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "Authorization:") == null);
+    try std.testing.expect(std.mem.find(u8, raw, "refresh_token=old-refresh") != null);
+    try std.testing.expect(std.mem.find(u8, raw, "Authorization:") == null);
     gate.post(io);
     try session.workers.await(io);
     try authorize(&session, "Bearer new-access");
