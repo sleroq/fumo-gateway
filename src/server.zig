@@ -14,10 +14,14 @@ const routes = std.StaticStringMap(Route).initComptime(.{
 const max_connections = 64;
 const request_timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(5), .clock = .awake };
 
-/// session is service-owned; all connections finish before its caller deinitializes it.
+/// allocator must be thread-safe. The HTTP client is service-owned; all
+/// connections finish before it or the caller-owned session is deinitialized.
 pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config, session: ?*Session) !void {
     var listener = try config.address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
 
     var active: std.atomic.Value(usize) = .init(0);
     var connections: std.Io.Group = .init;
@@ -33,7 +37,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config, se
             continue;
         }
         const deadline = std.Io.Clock.Timestamp.fromNow(io, request_timeout);
-        connections.concurrent(io, handleConnection, .{ allocator, io, stream, config, session, &active, deadline }) catch |err| {
+        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, session, &active, deadline }) catch |err| {
             stream.close(io);
             _ = active.fetchSub(1, .monotonic);
             std.log.warn("event=connection_dispatch_failed error={s}", .{@errorName(err)});
@@ -43,13 +47,14 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config, se
 
 fn handleConnection(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    client: *std.http.Client,
     stream: std.Io.net.Stream,
     config: *const Config,
     session: ?*Session,
     active: *std.atomic.Value(usize),
     deadline: std.Io.Clock.Timestamp,
 ) void {
+    const io = client.io;
     defer _ = active.fetchSub(1, .monotonic);
     defer stream.close(io);
 
@@ -77,7 +82,7 @@ fn handleConnection(
             return;
         };
     }
-    const status = responses.forward(io, arena.allocator(), stream, config.upstream.?, &pending) catch |err| {
+    const status = responses.forward(client, arena.allocator(), stream, config.upstream.?, &pending) catch |err| {
         std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
         return;
     };
@@ -226,15 +231,15 @@ const TransportTest = struct {
     const payload = "{\"model\":\"demo\",\"stream\":true,\"opaque\":{\"nested\":[1,null,true]}}";
     const first = "data: {\"delta\":\"first\"}\n\n";
 
-    fn connect(config: *const Config, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
+    fn connect(upstream_client: *std.http.Client, config: *const Config, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
         var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
         defer listener.deinit(io);
         const client = try listener.socket.address.connect(io, .{ .mode = .stream });
         errdefer client.close(io);
         const accepted = try listener.accept(io);
         errdefer accepted.close(io);
-        active.store(1, .monotonic);
-        try tasks.concurrent(io, handleConnection, .{ allocator, io, accepted, config, null, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout) });
+        _ = active.fetchAdd(1, .monotonic);
+        try tasks.concurrent(io, handleConnection, .{ allocator, upstream_client, accepted, config, null, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout) });
         return client;
     }
 
@@ -277,6 +282,8 @@ const TransportTest = struct {
 
 test "transport socket relay preserves payload, isolates headers, and handles response framing without replay" {
     const T = TransportTest;
+    var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
+    defer upstream_client.deinit();
     const cases = [_]struct { reply: []const u8, status: []const u8, body: []const u8, chunked: bool = false, header: ?[]const u8 = null }{
         .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: application/json\r\nAuthorization: private\r\nConnection: X-Hop\r\nX-Hop: private\r\n\r\n{\"ok\":true}", .status = "200 OK", .body = "{\"ok\":true}" },
         .{ .reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: X-Hop\r\nX-Hop: private\r\n\r\n5\r\n{\"ok\"\r\n6\r\n:true}\r\n0\r\n\r\n", .status = "200 OK", .body = "{\"ok\":true}", .chunked = true },
@@ -305,7 +312,7 @@ test "transport socket relay preserves payload, isolates headers, and handles re
         var active: std.atomic.Value(usize) = .init(0);
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(T.io);
-        const client = try T.connect(&config, &active, &tasks);
+        const client = try T.connect(&upstream_client, &config, &active, &tasks);
         defer client.close(T.io);
         try T.send(client, case.chunked);
         const raw = try T.receive(client);
@@ -344,6 +351,8 @@ test "transport socket relay preserves payload, isolates headers, and handles re
 
 test "transport incremental SSE barrier and disconnect before or after headers close upstream" {
     const T = TransportTest;
+    var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
+    defer upstream_client.deinit();
     for ([_]enum { complete, disconnect_before_head, disconnect_after_head }{ .complete, .disconnect_before_head, .disconnect_after_head }) |mode| {
         var gate: std.Io.Semaphore = .{};
         const head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
@@ -366,7 +375,7 @@ test "transport incremental SSE barrier and disconnect before or after headers c
         var active: std.atomic.Value(usize) = .init(0);
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(T.io);
-        const client = try T.connect(&config, &active, &tasks);
+        const client = try T.connect(&upstream_client, &config, &active, &tasks);
         var client_open = true;
         defer if (client_open) client.close(T.io);
         try T.send(client, false);
@@ -391,6 +400,76 @@ test "transport incremental SSE barrier and disconnect before or after headers c
         }
         try std.testing.expectEqual(1, fixture.count.load(.acquire));
     }
+}
+
+test "transport shared client isolates concurrent cancellation and remains usable" {
+    const T = TransportTest;
+    var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
+    defer upstream_client.deinit();
+    var stalled = try T.fixture.Fixture.init(T.allocator, T.io, &.{.{ .bytes = "", .peer_eof = true }});
+    defer stalled.deinit();
+    try stalled.start();
+    var gate: std.Io.Semaphore = .{};
+    const tail = "data: [DONE]\n\n";
+    var healthy = try T.fixture.Fixture.init(T.allocator, T.io, &.{
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" ++ T.first, .gate = &gate, .tail = tail },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+    });
+    defer healthy.deinit();
+    try healthy.start();
+    const stalled_url = try stalled.origin(T.allocator);
+    defer T.allocator.free(stalled_url);
+    const healthy_url = try healthy.origin(T.allocator);
+    defer T.allocator.free(healthy_url);
+    var upstream: @import("config.zig").Upstream = .{ .url = stalled_url, .models = .{} };
+    defer upstream.models.deinit(T.allocator);
+    try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    var healthy_config = config;
+    healthy_config.upstream.?.url = healthy_url;
+    var active: std.atomic.Value(usize) = .init(0);
+    var tasks: std.Io.Group = .init;
+    defer tasks.cancel(T.io);
+
+    const canceled = try T.connect(&upstream_client, &config, &active, &tasks);
+    var canceled_open = true;
+    defer if (canceled_open) canceled.close(T.io);
+    try T.send(canceled, false);
+    try stalled.waitRequest();
+    const streaming = try T.connect(&upstream_client, &healthy_config, &active, &tasks);
+    defer streaming.close(T.io);
+    try T.send(streaming, false);
+    try healthy.waitRequest();
+    var completed: std.Io.Semaphore = .{};
+    var prefix = try T.io.concurrent(T.prefix, .{ streaming, &completed });
+    defer _ = prefix.cancel(T.io) catch {};
+    try completed.waitTimeout(T.io, .{ .duration = request_timeout });
+    try prefix.await(T.io);
+
+    canceled.close(T.io);
+    canceled_open = false;
+    try stalled.waitEof();
+    gate.post(T.io);
+    const rest = try T.receive(streaming);
+    defer T.allocator.free(rest);
+    try std.testing.expect(std.mem.find(u8, rest, tail) != null);
+    try tasks.await(T.io);
+    try std.testing.expectEqual(0, active.load(.monotonic));
+    try std.testing.expect(upstream_client.connection_pool.used.first == null);
+
+    const next = try T.connect(&upstream_client, &healthy_config, &active, &tasks);
+    defer next.close(T.io);
+    try T.send(next, false);
+    const raw = try T.receive(next);
+    defer T.allocator.free(raw);
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, raw, "ok"));
+    try healthy.waitRequest();
+    try tasks.await(T.io);
+    try std.testing.expectEqual(0, active.load(.monotonic));
+    try std.testing.expect(upstream_client.connection_pool.used.first == null);
+    try std.testing.expectEqual(0, upstream_client.connection_pool.free_len);
 }
 
 test "transport oversized request is rejected before reading or inviting body" {

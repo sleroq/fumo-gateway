@@ -41,8 +41,10 @@ fn rewriteModel(allocator: std.mem.Allocator, body: []const u8, upstream: Upstre
 }
 
 /// Once the request body is consumed, only the monitor reads downstream. Cancel
-/// and join the relay before releasing its HTTP client, buffers, or socket.
-pub fn forward(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, upstream: Upstream, pending: *Pending) !std.http.Status {
+/// and join the relay before releasing its buffers or socket. The HTTP client
+/// is borrowed from the service and outlives every relay.
+pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: std.Io.net.Stream, upstream: Upstream, pending: *Pending) !std.http.Status {
+    const io = client.io;
     const Completion = union(enum) { response: anyerror!std.http.Status, disconnected: void };
 
     var buffer: [2]Completion = undefined;
@@ -50,7 +52,7 @@ pub fn forward(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stre
     defer select.cancelDiscard();
 
     try select.concurrent(.disconnected, waitForDisconnect, .{ io, stream });
-    try select.concurrent(.response, relay, .{ io, allocator, upstream, pending });
+    try select.concurrent(.response, relay, .{ client, allocator, upstream, pending });
 
     return switch (try select.await()) {
         .response => |result| try result,
@@ -67,11 +69,11 @@ fn waitForDisconnect(io: std.Io, stream: std.Io.net.Stream) void {
     }
 }
 
-fn relay(io: std.Io, allocator: std.mem.Allocator, upstream: Upstream, pending: *Pending) !std.http.Status {
+fn relay(client: *std.http.Client, allocator: std.mem.Allocator, upstream: Upstream, pending: *Pending) !std.http.Status {
     var started = false;
-    return relayResponse(io, allocator, upstream, pending, &started) catch |err| {
+    return relayResponse(client, allocator, upstream, pending, &started) catch |err| {
         // Reader/Writer interfaces wrap cancellation in ReadFailed/WriteFailed.
-        try io.checkCancel();
+        try client.io.checkCancel();
         std.log.warn("event=upstream_failed error={s}", .{@errorName(err)});
         if (started) return err;
         try pending.request.respond("{\"error\":\"bad_gateway\"}\n", .{
@@ -83,10 +85,7 @@ fn relay(io: std.Io, allocator: std.mem.Allocator, upstream: Upstream, pending: 
     };
 }
 
-fn relayResponse(io: std.Io, allocator: std.mem.Allocator, upstream: Upstream, pending: *Pending, started: *bool) !std.http.Status {
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-
+fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, upstream: Upstream, pending: *Pending, started: *bool) !std.http.Status {
     var outgoing = try client.request(.POST, try std.Uri.parse(upstream.url), .{
         .keep_alive = false,
         .redirect_behavior = .unhandled,
