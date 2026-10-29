@@ -3,7 +3,7 @@
 **Goal:** A small, headless LLM gateway that centralizes subscription credentials, outbound connections, and metrics—not a general-purpose API compatibility platform.
 
 ### Supported upstreams
-- **Codex subscriptions:** device-code login, automatic token refresh, secure credential persistence, and Responses API access.
+- **ChatGPT subscriptions:** SIWC browser login with dynamic client registration (no legacy static-client auth), automatic token refresh, secure credential persistence, and Responses API access.
 - **OpenCode Go and Zen:** API-key authentication, configured as separate upstreams.
 - Initially **one upstream credential per provider**; no account pooling or automatic failover.
 
@@ -45,3 +45,22 @@ Universal protocol translation, WebSockets, automatic model-family guessing, acc
 
 - Concurrency is implemented via worker threads and std.Id.Threaded. With SSE this will likely cause a lot of workers to be waiting for idle SSE connections and needs to be fixed in the future
 - WebSockets would be cool to have for codex but it's probably very complex
+
+## Post V1 Features
+
+### Check subscription usage
+
+Store usage in memory and refresh regularly. Stop refreshing when no requests are coming.
+
+Report usage of each subscription for every provider that supports checking the usage in prometheus metrics and HTTP endoint
+
+For providers like opencode zen we can just report the balance or whatever we have access to. This should not be required.
+
+### Multiple sessions of same provider
+
+Consuming subscriptions in order
+
+### Access control for different keys
+
+- control what providers can key access
+- control what is the weekly / monthly allowed usage is for specific key in %
