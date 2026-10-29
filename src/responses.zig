@@ -60,8 +60,7 @@ fn monitorDownstream(io: std.Io, stream: std.Io.net.Stream) std.Io.net.Stream.Re
 fn relay(client: *std.http.Client, allocator: std.mem.Allocator, pending: *Pending) !std.http.Status {
     var started = false;
     return relayResponse(client, allocator, pending, &started) catch |err| {
-        // Reader/Writer interfaces wrap cancellation in ReadFailed/WriteFailed.
-        try client.io.checkCancel();
+        if (err == error.Canceled) return error.Canceled;
         std.log.warn("event=upstream_failed error={s}", .{@errorName(err)});
         if (started) return err;
         try pending.request.respond("{\"error\":\"bad_gateway\"}\n", .{
@@ -87,6 +86,26 @@ fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, pending
     });
     defer outgoing.deinit();
 
+    return transferResponse(&outgoing, allocator, pending, started) catch |err| {
+        // Cancellation is one-shot; recover it before deinit loses the transport errors.
+        const connection = outgoing.connection.?;
+        const read_err = connection.stream_reader.err orelse err;
+        const write_err = connection.stream_writer.err orelse err;
+        switch (err) {
+            error.ReadFailed => {
+                if (outgoing.reader.body_err == null and (read_err == error.Canceled or write_err == error.Canceled))
+                    return error.Canceled;
+            },
+            error.WriteFailed => {
+                if (write_err == error.Canceled) return error.Canceled;
+            },
+            else => {},
+        }
+        return err;
+    };
+}
+
+fn transferResponse(outgoing: *std.http.Client.Request, allocator: std.mem.Allocator, pending: *Pending, started: *bool) !std.http.Status {
     try outgoing.sendBodyComplete(pending.body);
 
     var response = try outgoing.receiveHead(&.{});
@@ -181,6 +200,91 @@ fn hopByHop(name: []const u8, iterator: std.http.HeaderIterator) bool {
         }
     }
     return false;
+}
+
+test "transport relay cancellation before headers or during a body propagates without a 502" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Body = struct {
+        fn observe(stream: std.Io.net.Stream, completed: *std.Io.Semaphore) !void {
+            defer completed.post(std.testing.io);
+            var buffer: [1024]u8 = undefined;
+            var reader = stream.reader(std.testing.io, &buffer);
+            while (try reader.interface.takeByte() != 'x') {}
+        }
+    };
+    const cases = [_][]const u8{
+        "",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n",
+    };
+    for (cases) |reply| {
+        var fixture = try @import("fixture").Fixture.init(a, io, &.{.{ .bytes = reply, .peer_eof = true }});
+        defer fixture.deinit();
+        try fixture.start();
+        const origin = try fixture.origin(a);
+        defer a.free(origin);
+        var client: std.http.Client = .{ .allocator = a, .io = io };
+        defer client.deinit();
+        var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+        defer listener.deinit(io);
+        const downstream = try listener.socket.address.connect(io, .{ .mode = .stream });
+        defer downstream.close(io);
+        const accepted = try listener.accept(io);
+        defer accepted.close(io);
+        var write_buffer: [1024]u8 = undefined;
+        var writer = accepted.writer(io, &write_buffer);
+        var request_reader = std.Io.Reader.fixed("POST /v1/responses HTTP/1.1\r\n\r\n");
+        var http = std.http.Server.init(&request_reader, &writer.interface);
+        var body = "{}".*;
+        var pending: Pending = .{ .request = try http.receiveHead(), .url = origin, .body = &body, .headers = &.{}, .client = "fixture" };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var task = try io.concurrent(relay, .{ &client, arena.allocator(), &pending });
+        defer _ = task.cancel(io) catch {};
+        try fixture.waitRequest();
+        if (reply.len != 0) {
+            // Observe forwarded body data before canceling, not just an upstream write.
+            var completed: std.Io.Semaphore = .{};
+            var observation = try io.concurrent(Body.observe, .{ downstream, &completed });
+            defer _ = observation.cancel(io) catch {};
+            try completed.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try observation.await(io);
+        }
+        try std.testing.expectError(error.Canceled, task.cancel(io));
+        try fixture.waitEof();
+        try std.testing.expectEqual(1, fixture.count.load(.acquire));
+        try std.testing.expect(client.connection_pool.used.first == null);
+    }
+}
+
+test "transport malformed or truncated chunk framing remains a non-cancellation error" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_][]const u8{ "invalid\r\n", "3\r\nx" }) |chunk| {
+        const reply = try std.mem.concat(a, u8, &.{ "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", chunk });
+        defer a.free(reply);
+        var fixture = try @import("fixture").Fixture.init(a, io, &.{.{ .bytes = reply }});
+        defer fixture.deinit();
+        try fixture.start();
+        const origin = try fixture.origin(a);
+        defer a.free(origin);
+        var client: std.http.Client = .{ .allocator = a, .io = io };
+        defer client.deinit();
+        var writer: std.Io.Writer.Allocating = .init(a);
+        defer writer.deinit();
+        var reader = std.Io.Reader.fixed("POST /v1/responses HTTP/1.1\r\n\r\n");
+        var http = std.http.Server.init(&reader, &writer.writer);
+        var body = "{}".*;
+        var pending: Pending = .{ .request = try http.receiveHead(), .url = origin, .body = &body, .headers = &.{}, .client = "fixture" };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try std.testing.expectError(error.ReadFailed, relay(&client, arena.allocator(), &pending));
+        try std.testing.expect(std.mem.startsWith(u8, writer.written(), "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.find(u8, writer.written(), "bad_gateway") == null);
+        try fixture.waitRequest();
+        try std.testing.expectEqual(1, fixture.count.load(.acquire));
+    }
 }
 
 test "transport applies the supplied provider contract without forwarding gateway auth or hop headers" {
