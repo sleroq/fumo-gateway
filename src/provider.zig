@@ -93,10 +93,10 @@ pub const Contract = enum {
         };
     }
 
-    /// Returns an allocator-owned body; parsed values do not escape.
-    pub fn rewriteRequest(self: Contract, allocator: std.mem.Allocator, body: []const u8, models: std.json.ArrayHashMap([]const u8)) ![]u8 {
-        try validateRequestDepth(allocator, body);
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{ .parse_numbers = false }) catch |err| switch (err) {
+    /// gpa must reclaim scratch on free; allocator owns only the returned body.
+    pub fn rewriteRequest(self: Contract, gpa: std.mem.Allocator, allocator: std.mem.Allocator, body: []const u8, models: std.json.ArrayHashMap([]const u8)) ![]u8 {
+        try validateRequestDepth(gpa, body);
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .parse_numbers = false }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidRequest,
         };
@@ -163,7 +163,7 @@ test "provider model rewrite preserves native request fields" {
     var models: std.json.ArrayHashMap([]const u8) = .{};
     defer models.deinit(std.testing.allocator);
     try models.map.put(std.testing.allocator, "demo", "upstream-model");
-    const body = try Contract.responses.rewriteRequest(std.testing.allocator,
+    const body = try Contract.responses.rewriteRequest(std.testing.allocator, std.testing.allocator,
         \\{"model":"demo","input":[{"type":"function_call_output","call_id":"123","output":"ok"}],"stream":false,"store":true,"temperature":0.5,"max_output_tokens":99,"reasoning":{"effort":"high"},"previous_response_id":"resp_1","metadata":{"precise":18446744073709551617}}
     , models);
     defer std.testing.allocator.free(body);
@@ -178,9 +178,9 @@ test "provider model rewrite preserves native request fields" {
     try std.testing.expect(value.object.get("store").?.bool);
     try std.testing.expectEqual(@as(i64, 99), value.object.get("max_output_tokens").?.integer);
     try std.testing.expectEqual(@as(f64, 0.5), value.object.get("temperature").?.float);
-    try std.testing.expectError(error.UnknownModel, Contract.responses.rewriteRequest(std.testing.allocator, "{\"model\":\"unknown\"}", models));
+    try std.testing.expectError(error.UnknownModel, Contract.responses.rewriteRequest(std.testing.allocator, std.testing.allocator, "{\"model\":\"unknown\"}", models));
     for ([_][]const u8{ "invalid", "[]", "{}", "{\"model\":1}" }) |invalid| {
-        try std.testing.expectError(error.InvalidRequest, Contract.responses.rewriteRequest(std.testing.allocator, invalid, models));
+        try std.testing.expectError(error.InvalidRequest, Contract.responses.rewriteRequest(std.testing.allocator, std.testing.allocator, invalid, models));
     }
 }
 
@@ -206,9 +206,9 @@ test "provider request depth bounds arrays, objects, and mixed containers for bo
                 }
                 try input.writer.writeAll("}");
                 if (depth > max_request_depth) {
-                    try std.testing.expectError(error.InvalidRequest, contract.rewriteRequest(a, input.written(), models));
+                    try std.testing.expectError(error.InvalidRequest, contract.rewriteRequest(a, a, input.written(), models));
                 } else {
-                    const body = try contract.rewriteRequest(a, input.written(), models);
+                    const body = try contract.rewriteRequest(a, a, input.written(), models);
                     defer a.free(body);
                     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
                 }
@@ -232,7 +232,7 @@ test "provider request depth ignores string delimiters and counts nesting rather
     try input.writer.writeAll("\"");
     for (0..300) |_| try input.writer.writeAll(",[{},[]]");
     try input.writer.writeAll("]}");
-    const body = try Contract.responses.rewriteRequest(a, input.written(), models);
+    const body = try Contract.responses.rewriteRequest(a, a, input.written(), models);
     defer a.free(body);
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
 }
@@ -245,19 +245,19 @@ test "provider SIWC requires streaming, disables storage, and rejects unsupporte
     for ([_][]const u8{ "", ",\"store\":false" }) |store| {
         const input = try std.fmt.allocPrint(a, "{{\"model\":\"demo\",\"stream\":true{s}}}", .{store});
         defer a.free(input);
-        const body = try Contract.siwc.rewriteRequest(a, input, models);
+        const body = try Contract.siwc.rewriteRequest(a, a, input, models);
         defer a.free(body);
         try std.testing.expectEqualStrings("{\"model\":\"upstream-model\",\"stream\":true,\"store\":false}", body);
     }
     for ([_][]const u8{ "", ",\"stream\":false", ",\"stream\":null", ",\"stream\":\"true\"", ",\"stream\":true,\"store\":true", ",\"stream\":true,\"store\":null" }) |fields| {
         const input = try std.fmt.allocPrint(a, "{{\"model\":\"demo\"{s}}}", .{fields});
         defer a.free(input);
-        try std.testing.expectError(error.InvalidRequest, Contract.siwc.rewriteRequest(a, input, models));
+        try std.testing.expectError(error.InvalidRequest, Contract.siwc.rewriteRequest(a, a, input, models));
     }
     for (siwc_unsupported_fields) |field| {
         const input = try std.fmt.allocPrint(a, "{{\"model\":\"demo\",\"stream\":true,\"{s}\":null}}", .{field});
         defer a.free(input);
-        try std.testing.expectError(error.InvalidRequest, Contract.siwc.rewriteRequest(a, input, models));
+        try std.testing.expectError(error.InvalidRequest, Contract.siwc.rewriteRequest(a, a, input, models));
     }
 }
 

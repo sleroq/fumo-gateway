@@ -13,16 +13,18 @@ pub const Pending = struct {
     authorization: ?[]const u8 = null,
 };
 
+/// gpa reclaims input/parsing scratch before return; allocator owns pending data.
 /// Capture headers before reading the body invalidates the HTTP head buffer.
-pub fn prepare(allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
+pub fn prepare(gpa: std.mem.Allocator, allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
     const headers = try requestHeaders(allocator, request, upstream.contract());
     if (request.head.content_length) |length| {
         if (length > max_body_size) return error.StreamTooLong;
     }
 
     const reader = try request.readerExpectContinue(&.{});
-    const body = try reader.allocRemaining(allocator, .limited(max_body_size));
-    const rewritten = try upstream.contract().rewriteRequest(allocator, body, upstream.models);
+    const body = try reader.allocRemaining(gpa, .limited(max_body_size));
+    defer gpa.free(body);
+    const rewritten = try upstream.contract().rewriteRequest(gpa, allocator, body, upstream.models);
 
     return .{ .request = request.*, .url = upstream.url, .body = rewritten, .headers = headers, .client = client };
 }
@@ -287,6 +289,44 @@ test "transport malformed or truncated chunk framing remains a non-cancellation 
     }
 }
 
+test "transport preparation releases scratch before pending data is used" {
+    const a = std.testing.allocator;
+    var upstream: Upstream = .{
+        .url = "https://api.openai.com/v1/responses",
+        .models = .{},
+        .auth = .{ .provider = .codex },
+    };
+    defer upstream.models.deinit(a);
+    try upstream.models.map.put(a, "demo", "upstream-model");
+    const cases = [_]struct { body: []const u8, err: ?anyerror = null }{
+        .{ .body = "{\"model\":\"demo\",\"stream\":true,\"input\":[0,1,2]}" },
+        .{ .body = "{\"model\":", .err = error.InvalidRequest },
+        .{ .body = "{\"model\":\"unknown\",\"stream\":true}", .err = error.UnknownModel },
+        .{ .body = "{\"model\":\"demo\",\"stream\":false}", .err = error.InvalidRequest },
+    };
+    for (cases) |case| {
+        const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nSession_id: session\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.body.len, case.body });
+        defer a.free(raw);
+        var reader = std.Io.Reader.fixed(raw);
+        var writer: std.Io.Writer.Discarding = .init(&.{});
+        var http = std.http.Server.init(&reader, &writer.writer);
+        var request = try http.receiveHead();
+        var retained = std.heap.ArenaAllocator.init(a);
+        defer retained.deinit();
+        var scratch = std.testing.FailingAllocator.init(a, .{});
+        const result = prepare(scratch.allocator(), retained.allocator(), &request, upstream, "fixture");
+        if (case.err) |err| {
+            try std.testing.expectError(err, result);
+        } else {
+            const pending = try result;
+            try std.testing.expectEqualStrings("{\"model\":\"upstream-model\",\"stream\":true,\"input\":[0,1,2],\"store\":false}", pending.body);
+            try std.testing.expectEqualStrings("session", pending.headers[0].value);
+        }
+        try std.testing.expect(scratch.allocations > 0);
+        try std.testing.expectEqual(scratch.allocated_bytes, scratch.freed_bytes);
+    }
+}
+
 test "transport applies the supplied provider contract without forwarding gateway auth or hop headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -331,7 +371,7 @@ test "transport SIWC fixture enforces provider body and headers while preserving
     var request = try http.receiveHead();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var pending = try prepare(arena.allocator(), &request, upstream, "fixture");
+    var pending = try prepare(a, arena.allocator(), &request, upstream, "fixture");
     pending.authorization = "Bearer fixture-access";
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();

@@ -68,7 +68,7 @@ fn handleConnection(
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var pending = (prepareRequestWithDeadline(io, arena.allocator(), &http, config, deadline) catch |err| {
+    var pending = (prepareRequestWithDeadline(io, allocator, arena.allocator(), &http, config, deadline) catch |err| {
         std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
         return;
     }) orelse return;
@@ -93,20 +93,21 @@ fn handleConnection(
 
 fn prepareRequestWithDeadline(
     io: std.Io,
+    gpa: std.mem.Allocator,
     allocator: std.mem.Allocator,
     http: *std.http.Server,
     config: *const Config,
     deadline: std.Io.Clock.Timestamp,
 ) !?responses.Pending {
     var completed: std.Io.Semaphore = .{};
-    var task = try io.concurrent(prepareRequest, .{ io, allocator, http, config, &completed });
+    var task = try io.concurrent(prepareRequest, .{ io, gpa, allocator, http, config, &completed });
     // Only request reception is timed; long-lived SSE is not cut off.
     defer _ = task.cancel(io) catch null;
     try completed.waitTimeout(io, .{ .deadline = deadline });
     return try task.await(io);
 }
 
-fn prepareRequest(io: std.Io, allocator: std.mem.Allocator, http: *std.http.Server, config: *const Config, completed: *std.Io.Semaphore) !?responses.Pending {
+fn prepareRequest(io: std.Io, gpa: std.mem.Allocator, allocator: std.mem.Allocator, http: *std.http.Server, config: *const Config, completed: *std.Io.Semaphore) !?responses.Pending {
     defer completed.post(io);
 
     var request = try http.receiveHead();
@@ -130,7 +131,7 @@ fn prepareRequest(io: std.Io, allocator: std.mem.Allocator, http: *std.http.Serv
         },
         .responses => if (client != null and request.head.method == .POST) {
             if (config.upstream) |upstream| {
-                if (responses.prepare(allocator, &request, upstream, client.?)) |pending| {
+                if (responses.prepare(gpa, allocator, &request, upstream, client.?)) |pending| {
                     return pending;
                 } else |err| switch (err) {
                     error.InvalidRequest => {
@@ -215,7 +216,7 @@ test "HTTP health, authentication, and routing" {
         defer writer.deinit();
         var http = std.http.Server.init(&reader, &writer.writer);
         var completed: std.Io.Semaphore = .{};
-        _ = try prepareRequest(std.testing.io, std.testing.allocator, &http, &config, &completed);
+        _ = try prepareRequest(std.testing.io, std.testing.allocator, std.testing.allocator, &http, &config, &completed);
         const response = writer.written();
         try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 " ++ case[1]));
         try std.testing.expect(std.mem.find(u8, response, "100 Continue") == null);
@@ -634,7 +635,7 @@ test "transport SIWC invalid contracts fail locally after gateway authentication
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var completed: std.Io.Semaphore = .{};
-        try std.testing.expectEqual(null, try prepareRequest(std.testing.io, arena.allocator(), &http, &config, &completed));
+        try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed));
         try std.testing.expect(std.mem.find(u8, writer.written(), case[2]) != null);
         try std.testing.expect(std.mem.find(u8, writer.written(), case[3]) != null);
     }
@@ -655,7 +656,7 @@ test "transport oversized request is rejected before reading or inviting body" {
     defer writer.deinit();
     var http = std.http.Server.init(&reader, &writer.writer);
     var completed: std.Io.Semaphore = .{};
-    try std.testing.expectEqual(null, try prepareRequest(std.testing.io, arena.allocator(), &http, &config, &completed));
+    try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed));
     try std.testing.expect(std.mem.startsWith(u8, writer.written(), "HTTP/1.1 413 "));
     try std.testing.expect(std.mem.find(u8, writer.written(), "100 Continue") == null);
 }
