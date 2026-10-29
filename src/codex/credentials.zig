@@ -92,6 +92,7 @@ pub fn save(allocator: std.mem.Allocator, io: Io, directory: []const u8, credent
 pub fn load(allocator: std.mem.Allocator, io: Io, directory: []const u8) !std.json.Parsed(Credentials) {
     const dir = try openDirectory(io, directory, false);
     defer dir.close(io);
+    try checkExistingFile(io, dir);
     const file = try dir.openFile(io, "codex.json", .{ .follow_symlinks = false });
     defer file.close(io);
     const stat = try file.stat(io);
