@@ -80,7 +80,6 @@ fn relay(client: *std.http.Client, allocator: std.mem.Allocator, pending: *Pendi
 
 fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, pending: *Pending, started: *bool) !std.http.Status {
     var outgoing = try client.request(.POST, try std.Uri.parse(pending.url), .{
-        .keep_alive = false,
         .redirect_behavior = .unhandled,
         .headers = .{
             .authorization = if (pending.authorization) |value| .{ .override = value } else .omit,
@@ -95,6 +94,9 @@ fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, pending
     return transferResponse(&outgoing, allocator, pending, started) catch |err| {
         // Cancellation is one-shot; recover it before deinit loses the transport errors.
         const connection = outgoing.connection.?;
+        // FIXME: this is weird and should be fixes in std
+        // Before receiveHead, even a partially sent request has reader state .ready.
+        connection.closing = true;
         const read_err = connection.stream_reader.err orelse err;
         const write_err = connection.stream_writer.err orelse err;
         switch (err) {
@@ -120,9 +122,15 @@ fn transferResponse(outgoing: *std.http.Client.Request, allocator: std.mem.Alloc
         response = try outgoing.receiveHead(&.{});
     }
 
+    // std's head parser recognizes only a standalone Connection: close value.
+    if (hasConnectionToken("close", response.head.iterateHeaders())) outgoing.connection.?.closing = true;
+
     const status = response.head.status;
     const headers = try responseHeaders(allocator, response.head);
     if (status == .no_content or status == .not_modified) {
+        // These statuses end at the head, even with a representation Content-Length.
+        // Tell the HTTP reader the exchange is complete before returning it to the pool.
+        _ = outgoing.reader.bodyReader(&.{}, .none, 0);
         started.* = true;
         try pending.request.respond("", .{
             .status = status,
@@ -201,6 +209,10 @@ fn hopByHop(name: []const u8, iterator: std.http.HeaderIterator) bool {
         if (std.ascii.eqlIgnoreCase(name, hop)) return true;
     }
 
+    return hasConnectionToken(name, iterator);
+}
+
+fn hasConnectionToken(name: []const u8, iterator: std.http.HeaderIterator) bool {
     var headers = iterator;
     while (headers.next()) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
@@ -265,7 +277,41 @@ test "transport relay cancellation before headers or during a body propagates wi
         try fixture.waitEof();
         try std.testing.expectEqual(1, fixture.count.load(.acquire));
         try std.testing.expect(client.connection_pool.used.first == null);
+        try std.testing.expectEqual(0, client.connection_pool.free_len);
     }
+}
+
+test "transport cancellation during upstream upload discards the incomplete connection" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer listener.deinit(io);
+    const origin = try std.fmt.allocPrint(a, "http://{f}", .{listener.socket.address});
+    defer a.free(origin);
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    var writer: std.Io.Writer.Allocating = .init(a);
+    defer writer.deinit();
+    var reader = std.Io.Reader.fixed("POST /v1/responses HTTP/1.1\r\n\r\n");
+    var http = std.http.Server.init(&reader, &writer.writer);
+    const body = try a.alloc(u8, max_body_size);
+    defer a.free(body);
+    @memset(body, 'x');
+    var pending: Pending = .{ .request = try http.receiveHead(), .url = origin, .body = body, .headers = &.{}, .client = "fixture" };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var task = try io.concurrent(relay, .{ &client, arena.allocator(), &pending });
+    defer _ = task.cancel(io) catch {};
+    const upstream = try listener.accept(io);
+    defer upstream.close(io);
+    var buffer: [1024]u8 = undefined;
+    var upstream_reader = upstream.reader(io, &buffer);
+    // Read only the head; the bounded socket buffers cannot hold the whole upload.
+    while (!std.mem.eql(u8, try upstream_reader.interface.takeDelimiterInclusive('\n'), "\r\n")) {}
+    try std.testing.expectError(error.Canceled, task.cancel(io));
+    try std.testing.expectEqual(0, writer.written().len);
+    try std.testing.expect(client.connection_pool.used.first == null);
+    try std.testing.expectEqual(0, client.connection_pool.free_len);
 }
 
 test "transport malformed or truncated chunk framing remains a non-cancellation error" {
@@ -294,6 +340,8 @@ test "transport malformed or truncated chunk framing remains a non-cancellation 
         try std.testing.expect(std.mem.find(u8, writer.written(), "bad_gateway") == null);
         try fixture.waitRequest();
         try std.testing.expectEqual(1, fixture.count.load(.acquire));
+        try std.testing.expect(client.connection_pool.used.first == null);
+        try std.testing.expectEqual(0, client.connection_pool.free_len);
     }
 }
 

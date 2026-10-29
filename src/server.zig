@@ -298,8 +298,8 @@ test "transport rejects deeply nested JSON without forwarding and serves the nex
     var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
     defer upstream_client.deinit();
     var fixture = try T.fixture.Fixture.init(T.allocator, T.io, &.{
-        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
-        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .reuse = true },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .peer_eof = true },
     });
     defer fixture.deinit();
     try fixture.start();
@@ -484,6 +484,108 @@ test "transport incremental SSE survives half-close and resets before or after h
     }
 }
 
+test "transport sequential inferences reuse only complete persistent upstream connections without replay" {
+    const T = TransportTest;
+    const cases = [_]struct { reply: []const u8, reusable: bool = true }{
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+        .{ .reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-Trailer: done\r\n\r\n" },
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" },
+        .{ .reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" },
+        .{ .reply = "HTTP/1.1 204 No Content\r\n\r\n" },
+        .{ .reply = "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n" },
+        .{ .reply = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /never-follow\r\nContent-Length: 4\r\n\r\nmove" },
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", .reusable = false },
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive, cLoSe\r\n\r\nok", .reusable = false },
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\nConnection: X-Hop\r\n\r\nok", .reusable = false },
+        .{ .reply = "HTTP/1.1 200 OK\r\n\r\nconnection-delimited", .reusable = false },
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort", .reusable = false },
+        .{ .reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\ninvalid\r\n", .reusable = false },
+        .{ .reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nx", .reusable = false },
+    };
+    for (cases) |case| {
+        var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
+        defer upstream_client.deinit();
+        var fixture = try T.fixture.Fixture.init(T.allocator, T.io, &.{
+            .{ .bytes = case.reply, .reuse = case.reusable },
+            .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .peer_eof = true },
+        });
+        defer fixture.deinit();
+        try fixture.start();
+        const origin = try fixture.origin(T.allocator);
+        defer T.allocator.free(origin);
+        var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
+        defer upstream.models.deinit(T.allocator);
+        try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+        const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+        var active: std.atomic.Value(usize) = .init(0);
+        var tasks: std.Io.Group = .init;
+        defer tasks.cancel(T.io);
+
+        for (0..2) |index| {
+            const downstream = try T.connect(&upstream_client, &config, &active, &tasks);
+            defer downstream.close(T.io);
+            try T.send(downstream, false);
+            const raw = try T.receive(downstream);
+            defer T.allocator.free(raw);
+            try tasks.await(T.io);
+            try fixture.waitRequest();
+            try std.testing.expectEqual(index + 1, fixture.count.load(.acquire));
+            try std.testing.expectEqual(if (case.reusable) 1 else index + 1, fixture.accepted.load(.acquire));
+            try std.testing.expectEqual(0, active.load(.monotonic));
+            try std.testing.expect(upstream_client.connection_pool.used.first == null);
+            try std.testing.expectEqual(@as(usize, if (index == 1 or case.reusable) 1 else 0), upstream_client.connection_pool.free_len);
+            if (index == 1) {
+                try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+                try std.testing.expect(std.mem.endsWith(u8, raw, "ok"));
+            }
+        }
+    }
+}
+
+test "transport an upstream closing an idle pooled socket fails the next inference without replay" {
+    const T = TransportTest;
+    var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
+    defer upstream_client.deinit();
+    // Advertise persistence, then close after the complete first response.
+    var fixture = try T.fixture.Fixture.init(T.allocator, T.io, &.{.{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" }});
+    defer fixture.deinit();
+    try fixture.start();
+    const origin = try fixture.origin(T.allocator);
+    defer T.allocator.free(origin);
+    var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
+    defer upstream.models.deinit(T.allocator);
+    try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    var active: std.atomic.Value(usize) = .init(0);
+    var tasks: std.Io.Group = .init;
+    defer tasks.cancel(T.io);
+
+    for (0..2) |index| {
+        const downstream = try T.connect(&upstream_client, &config, &active, &tasks);
+        defer downstream.close(T.io);
+        try T.send(downstream, false);
+        const raw = try T.receive(downstream);
+        defer T.allocator.free(raw);
+        try tasks.await(T.io);
+        if (index == 0) {
+            try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+            try fixture.waitRequest();
+            // Join the fixture to ensure the pooled socket is closed before request two.
+            // Its listener stays open; an automatic reconnect/retry would time out.
+            try fixture.tasks.await(T.io);
+            try std.testing.expectEqual(1, upstream_client.connection_pool.free_len);
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 502 Bad Gateway\r\n"));
+            try std.testing.expectEqual(0, upstream_client.connection_pool.free_len);
+        }
+        try std.testing.expectEqual(1, fixture.count.load(.acquire));
+        try std.testing.expectEqual(1, fixture.accepted.load(.acquire));
+        try std.testing.expect(upstream_client.connection_pool.used.first == null);
+    }
+}
+
 test "transport shared client isolates concurrent cancellation and remains usable" {
     const T = TransportTest;
     var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
@@ -494,8 +596,8 @@ test "transport shared client isolates concurrent cancellation and remains usabl
     var gate: std.Io.Semaphore = .{};
     const tail = "data: [DONE]\n\n";
     var healthy = try T.fixture.Fixture.init(T.allocator, T.io, &.{
-        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" ++ T.first, .gate = &gate, .tail = tail },
-        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " ++ std.fmt.comptimePrint("{d}", .{T.first.len + tail.len}) ++ "\r\n\r\n" ++ T.first, .gate = &gate, .tail = tail, .reuse = true },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .peer_eof = true },
     });
     defer healthy.deinit();
     try healthy.start();
@@ -539,6 +641,7 @@ test "transport shared client isolates concurrent cancellation and remains usabl
     try tasks.await(T.io);
     try std.testing.expectEqual(0, active.load(.monotonic));
     try std.testing.expect(upstream_client.connection_pool.used.first == null);
+    try std.testing.expectEqual(1, upstream_client.connection_pool.free_len);
 
     const next = try T.connect(&upstream_client, &healthy_config, &active, &tasks);
     defer next.close(T.io);
@@ -551,7 +654,10 @@ test "transport shared client isolates concurrent cancellation and remains usabl
     try tasks.await(T.io);
     try std.testing.expectEqual(0, active.load(.monotonic));
     try std.testing.expect(upstream_client.connection_pool.used.first == null);
-    try std.testing.expectEqual(0, upstream_client.connection_pool.free_len);
+    try std.testing.expectEqual(1, upstream_client.connection_pool.free_len);
+    try std.testing.expectEqual(1, healthy.accepted.load(.acquire));
+    try std.testing.expectEqual(2, healthy.count.load(.acquire));
+    try std.testing.expectEqual(1, stalled.count.load(.acquire));
 }
 
 test "transport unavailable SIWC credentials return 503 without sending inference" {

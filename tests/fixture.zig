@@ -6,6 +6,8 @@ pub const Reply = struct {
     gate: ?*Io.Semaphore = null,
     tail: []const u8 = "",
     peer_eof: bool = false,
+    /// Serve the following reply on this same accepted socket.
+    reuse: bool = false,
 };
 
 /// Fixed local HTTP exchanges. Keep at a stable address after start. Captures
@@ -17,6 +19,7 @@ pub const Fixture = struct {
     replies: []const Reply,
     requests: []?[]u8,
     count: std.atomic.Value(usize) = .init(0),
+    accepted: std.atomic.Value(usize) = .init(0),
     received: Io.Semaphore = .{},
     eof: Io.Semaphore = .{},
     tasks: Io.Group = .init,
@@ -71,42 +74,49 @@ pub const Fixture = struct {
     }
 
     fn run(self: *Fixture) !void {
-        for (self.replies, 0..) |reply, index| {
+        var index: usize = 0;
+        while (index < self.replies.len) {
             const stream = try self.listener.accept(self.io);
             defer stream.close(self.io);
+            _ = self.accepted.fetchAdd(1, .release);
             var buffer: [8192]u8 = undefined;
             var reader = stream.reader(self.io, &buffer);
-            var raw: std.Io.Writer.Allocating = .init(self.allocator);
-            defer raw.deinit();
-            var content_length: usize = 0;
-            while (true) {
-                const line = try reader.interface.takeDelimiterInclusive('\n');
-                try raw.writer.writeAll(line);
-                if (std.ascii.startsWithIgnoreCase(line, "content-length:"))
-                    content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \r\n"), 10);
-                if (std.mem.eql(u8, line, "\r\n")) break;
-            }
-            if (content_length > 1024 * 1024) return error.RequestTooLarge;
-            const body = try self.allocator.alloc(u8, content_length);
-            defer self.allocator.free(body);
-            try reader.interface.readSliceAll(body);
-            try raw.writer.writeAll(body);
-            self.requests[index] = try self.allocator.dupe(u8, raw.written());
-            _ = self.count.fetchAdd(1, .release);
-            self.received.post(self.io);
-            var write_buffer: [1024]u8 = undefined;
-            var writer = stream.writer(self.io, &write_buffer);
-            try writer.interface.writeAll(reply.bytes);
-            try writer.interface.flush();
-            if (reply.gate) |gate| try gate.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-            try writer.interface.writeAll(reply.tail);
-            try writer.interface.flush();
-            if (reply.peer_eof) {
-                while (true) _ = reader.interface.takeByte() catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    else => return err,
-                };
-                self.eof.post(self.io);
+            while (index < self.replies.len) {
+                const reply = self.replies[index];
+                var raw: std.Io.Writer.Allocating = .init(self.allocator);
+                defer raw.deinit();
+                var content_length: usize = 0;
+                while (true) {
+                    const line = try reader.interface.takeDelimiterInclusive('\n');
+                    try raw.writer.writeAll(line);
+                    if (std.ascii.startsWithIgnoreCase(line, "content-length:"))
+                        content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \r\n"), 10);
+                    if (std.mem.eql(u8, line, "\r\n")) break;
+                }
+                if (content_length > 1024 * 1024) return error.RequestTooLarge;
+                const body = try self.allocator.alloc(u8, content_length);
+                defer self.allocator.free(body);
+                try reader.interface.readSliceAll(body);
+                try raw.writer.writeAll(body);
+                self.requests[index] = try self.allocator.dupe(u8, raw.written());
+                _ = self.count.fetchAdd(1, .release);
+                self.received.post(self.io);
+                var write_buffer: [1024]u8 = undefined;
+                var writer = stream.writer(self.io, &write_buffer);
+                try writer.interface.writeAll(reply.bytes);
+                try writer.interface.flush();
+                if (reply.gate) |gate| try gate.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                try writer.interface.writeAll(reply.tail);
+                try writer.interface.flush();
+                if (reply.peer_eof) {
+                    while (true) _ = reader.interface.takeByte() catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return reader.err orelse err,
+                    };
+                    self.eof.post(self.io);
+                }
+                index += 1;
+                if (!reply.reuse) break;
             }
         }
     }
