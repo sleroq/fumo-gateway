@@ -27,31 +27,32 @@ pub fn prepare(allocator: std.mem.Allocator, request: *std.http.Server.Request, 
     return .{ .request = request.*, .url = upstream.url, .body = rewritten, .headers = headers, .client = client };
 }
 
-/// Once the request body is consumed, only the monitor reads downstream. Cancel
-/// and join the relay before releasing its buffers or socket. The HTTP client
+/// Once the request body is consumed, only the monitor reads downstream. EOF
+/// closes only the client's sending direction; transport errors cancel the relay.
+/// Join both tasks before releasing their buffers or socket. The HTTP client
 /// is borrowed from the service and outlives every relay.
 pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: std.Io.net.Stream, pending: *Pending) !std.http.Status {
     const io = client.io;
-    const Completion = union(enum) { response: anyerror!std.http.Status, disconnected: void };
+    const Completion = union(enum) { response: anyerror!std.http.Status, downstream: std.Io.net.Stream.Reader.Error!void };
 
     var buffer: [2]Completion = undefined;
     var select = std.Io.Select(Completion).init(io, &buffer);
     defer select.cancelDiscard();
 
-    try select.concurrent(.disconnected, waitForDisconnect, .{ io, stream });
+    try select.concurrent(.downstream, monitorDownstream, .{ io, stream });
     try select.concurrent(.response, relay, .{ client, allocator, pending });
 
-    return switch (try select.await()) {
-        .response => |result| try result,
-        .disconnected => error.DownstreamDisconnected,
+    while (true) switch (try select.await()) {
+        .response => |result| return result,
+        .downstream => |result| try result,
     };
 }
 
-fn waitForDisconnect(io: std.Io, stream: std.Io.net.Stream) void {
+fn monitorDownstream(io: std.Io, stream: std.Io.net.Stream) std.Io.net.Stream.Reader.Error!void {
     var buffer: [1024]u8 = undefined;
     var data = [_][]u8{&buffer};
     while (true) {
-        const result = stream.readWithControl(io, &data, &.{}) catch return;
+        const result = try stream.readWithControl(io, &data, &.{});
         if (result.data_len == 0) return;
     }
 }

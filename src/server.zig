@@ -249,6 +249,12 @@ const TransportTest = struct {
         return client;
     }
 
+    fn reset(client: std.Io.net.Stream) !void {
+        const linger: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+        try std.posix.setsockopt(client.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger));
+        client.close(io);
+    }
+
     fn send(client: std.Io.net.Stream, chunked: bool) !void {
         var buffer: [1024]u8 = undefined;
         var writer = client.writer(io, &buffer);
@@ -290,12 +296,13 @@ test "transport socket relay preserves payload, isolates headers, and handles re
     const T = TransportTest;
     var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
     defer upstream_client.deinit();
-    const cases = [_]struct { reply: []const u8, status: []const u8, body: []const u8, chunked: bool = false, header: ?[]const u8 = null }{
+    const cases = [_]struct { reply: []const u8, status: []const u8, body: []const u8, chunked: bool = false, half_close: bool = false, header: ?[]const u8 = null }{
         .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: application/json\r\nAuthorization: private\r\nConnection: X-Hop\r\nX-Hop: private\r\n\r\n{\"ok\":true}", .status = "200 OK", .body = "{\"ok\":true}" },
         .{ .reply = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: X-Hop\r\nX-Hop: private\r\n\r\n5\r\n{\"ok\"\r\n6\r\n:true}\r\n0\r\n\r\n", .status = "200 OK", .body = "{\"ok\":true}", .chunked = true },
         .{ .reply = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 4\r\nRetry-After: 17\r\n\r\nbusy", .status = "429 Too Many Requests", .body = "busy", .header = "retry-after: 17" },
         .{ .reply = "HTTP/1.1 307 Temporary Redirect\r\nContent-Length: 4\r\nLocation: /never-follow\r\n\r\nmove", .status = "307 Temporary Redirect", .body = "move", .header = "location: /never-follow" },
         .{ .reply = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .status = "200 OK", .body = "ok" },
+        .{ .reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .status = "200 OK", .body = "ok", .half_close = true },
         .{ .reply = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", .status = "502 Bad Gateway", .body = "{\"error\":\"bad_gateway\"}\n" },
         .{ .reply = "not HTTP\r\n\r\n", .status = "502 Bad Gateway", .body = "{\"error\":\"bad_gateway\"}\n" },
         .{ .reply = "HTTP/1.1 204 No Content\r\n\r\n", .status = "204 No Content", .body = "" },
@@ -321,6 +328,7 @@ test "transport socket relay preserves payload, isolates headers, and handles re
         const client = try T.connect(&upstream_client, &config, &active, &tasks);
         defer client.close(T.io);
         try T.send(client, case.chunked);
+        if (case.half_close) try client.shutdown(T.io, .send);
         const raw = try T.receive(client);
         defer T.allocator.free(raw);
         try fixture.waitRequest();
@@ -355,19 +363,21 @@ test "transport socket relay preserves payload, isolates headers, and handles re
     }
 }
 
-test "transport incremental SSE barrier and disconnect before or after headers close upstream" {
+test "transport incremental SSE survives half-close and resets before or after headers close upstream" {
     const T = TransportTest;
     var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
     defer upstream_client.deinit();
-    for ([_]enum { complete, disconnect_before_head, disconnect_after_head }{ .complete, .disconnect_before_head, .disconnect_after_head }) |mode| {
+    for ([_]enum { complete, half_close_before_head, half_close_after_head, reset_before_head, reset_after_head }{ .complete, .half_close_before_head, .half_close_after_head, .reset_before_head, .reset_after_head }) |mode| {
+        const before_head = mode == .half_close_before_head or mode == .reset_before_head;
+        const reset = mode == .reset_before_head or mode == .reset_after_head;
         var gate: std.Io.Semaphore = .{};
         const head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
         const tail = "data: [DONE]\n\n";
         var fixture = try T.fixture.Fixture.init(T.allocator, T.io, &.{.{
-            .bytes = if (mode == .disconnect_before_head) "" else head ++ T.first,
-            .gate = if (mode == .complete) &gate else null,
-            .tail = if (mode == .complete) tail else "",
-            .peer_eof = mode != .complete,
+            .bytes = if (before_head) "" else head ++ T.first,
+            .gate = if (reset) null else &gate,
+            .tail = if (reset) "" else if (before_head) head ++ T.first ++ tail else tail,
+            .peer_eof = reset,
         }});
         defer fixture.deinit();
         try fixture.start();
@@ -386,21 +396,27 @@ test "transport incremental SSE barrier and disconnect before or after headers c
         defer if (client_open) client.close(T.io);
         try T.send(client, false);
         try fixture.waitRequest();
-        if (mode != .disconnect_before_head) {
+        if (mode == .half_close_before_head) try client.shutdown(T.io, .send);
+        if (!before_head) {
             var completed: std.Io.Semaphore = .{};
             var task = try T.io.concurrent(T.prefix, .{ client, &completed });
             defer _ = task.cancel(T.io) catch {};
             try completed.waitTimeout(T.io, .{ .duration = request_timeout });
             try task.await(T.io);
         }
-        if (mode == .complete) {
+        if (!reset) {
+            if (mode == .half_close_after_head) try client.shutdown(T.io, .send);
             gate.post(T.io);
             const rest = try T.receive(client);
             defer T.allocator.free(rest);
             try std.testing.expect(std.mem.find(u8, rest, tail) != null);
             try std.testing.expect(std.mem.find(u8, rest, "error") == null);
+            if (before_head) {
+                try std.testing.expect(std.mem.startsWith(u8, rest, "HTTP/1.1 200 OK\r\n"));
+                try std.testing.expect(std.mem.find(u8, rest, T.first) != null);
+            }
         } else {
-            client.close(T.io);
+            try T.reset(client);
             client_open = false;
             try fixture.waitEof();
         }
@@ -453,7 +469,7 @@ test "transport shared client isolates concurrent cancellation and remains usabl
     try completed.waitTimeout(T.io, .{ .duration = request_timeout });
     try prefix.await(T.io);
 
-    canceled.close(T.io);
+    try T.reset(canceled);
     canceled_open = false;
     try stalled.waitEof();
     gate.post(T.io);
