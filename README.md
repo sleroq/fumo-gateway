@@ -1,21 +1,14 @@
 # fumo-gateway
 
-A small, headless LLM gateway. See [ROADMAP.md](ROADMAP.md) for the planned scope.
+Headless LLM gateway with Responses forwarding, model aliases, and Sign in with ChatGPT.
 
-## Run
+Requires Zig **0.17.0** (`nix develop`). Configure `gateway.json` using
+[`src/config.zig`](src/config.zig).
 
 ```sh
+zig build run -- auth login codex
 export FUMO_PI_KEY="$(openssl rand -hex 32)"
-export FUMO_DEV_KEY="$(openssl rand -hex 32)"
-zig build run -- --config gateway.example.json
+zig build run -- --config gateway.json
 ```
 
-## Development
-
-Requires Zig **0.17.0**, available through `nix develop`.
-
-```sh
-zig build
-zig build test
-zig fmt --check build.zig build.zig.zon src/
-```
+Tests: `zig build test`. Planned scope: [ROADMAP.md](ROADMAP.md).

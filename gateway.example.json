@@ -1,15 +1,15 @@
 {
-  "listen": "127.0.0.1:8080",
-  "upstream": {
-    "url": "http://127.0.0.1:9090/v1/responses",
-    "models": {"demo": "fixture-model"}
-  },
-  "clients": {
-    "pi": {
-      "key_env": "FUMO_PI_KEY"
+    "listen": "127.0.0.1:8080",
+    "upstream": {
+        "url": "https://api.openai.com/v1/responses",
+        "models": { "codex/gpt-6.1-sol": "gpt-6.1-sol" },
+        "auth": {
+            "provider": "codex"
+        }
     },
-    "development": {
-      "key_env": "FUMO_DEV_KEY"
+    "clients": {
+        "pi": {
+            "key_env": "FUMO_PI_KEY"
+        }
     }
-  }
 }
