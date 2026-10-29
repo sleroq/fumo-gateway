@@ -49,13 +49,13 @@ pub const Upstream = struct {
 /// Service-owned provider. Keep at a stable address once requests start, and
 /// finish them before deinit; the credential session owns refresh independently.
 pub const Provider = struct {
-    upstream: Upstream,
     session: ?Session = null,
 
+    /// Expects an upstream already validated and resolved by Upstream.configure.
+    /// In particular, auth.credentials_dir must be non-null when auth is enabled.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, upstream: Upstream) !Provider {
         try upstream.validateEndpoint();
         return .{
-            .upstream = upstream,
             .session = if (upstream.auth) |options| try Session.init(allocator, io, options.credentials_dir.?) else null,
         };
     }
