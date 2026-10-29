@@ -713,7 +713,7 @@ test "transport unavailable SIWC credentials return 503 without sending inferenc
     try std.testing.expect(!provider.session.?.refreshing);
 }
 
-test "transport SIWC invalid contracts fail locally after gateway authentication" {
+test "transport SIWC validates caller auth, JSON, and model aliases locally" {
     const a = std.testing.allocator;
     var upstream: @import("provider.zig").Upstream = .{
         .url = "https://api.openai.com/v1/responses",
@@ -725,11 +725,12 @@ test "transport SIWC invalid contracts fail locally after gateway authentication
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
     const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
     const cases = .{
-        .{ "wrong-key", "{\"model\":\"demo\",\"stream\":true}", "401 Unauthorized", "unauthorized" },
-        .{ "transport-secret", "{\"model\":\"demo\"}", "400 Bad Request", "invalid_request" },
-        .{ "transport-secret", "{\"model\":\"demo\",\"stream\":false}", "400 Bad Request", "invalid_request" },
-        .{ "transport-secret", "{\"model\":\"demo\",\"stream\":true,\"store\":true}", "400 Bad Request", "invalid_request" },
-        .{ "transport-secret", "{\"model\":\"demo\",\"stream\":true,\"max_output_tokens\":99}", "400 Bad Request", "invalid_request" },
+        .{ "wrong-key", "{\"model\":\"demo\",\"stream\":false,\"store\":true}", "401 Unauthorized", "unauthorized" },
+        .{ "transport-secret", "invalid", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "[]", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "{}", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "{\"model\":null}", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "{\"model\":\"unknown\"}", "400 Bad Request", "unknown_model" },
     };
     inline for (cases) |case| {
         const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ case[0], case[1].len, case[1] });

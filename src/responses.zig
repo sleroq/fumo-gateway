@@ -1,6 +1,6 @@
 const std = @import("std");
-const Upstream = @import("provider.zig").Upstream;
-const Contract = @import("provider.zig").Contract;
+const provider = @import("provider.zig");
+const Upstream = provider.Upstream;
 
 pub const max_body_size = 16 * 1024 * 1024;
 
@@ -18,7 +18,7 @@ pub const Pending = struct {
 /// allocations after forwarding, or partial allocations on any preparation error.
 /// Capture headers before reading the body invalidates the HTTP head buffer.
 pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
-    const headers = try requestHeaders(arena_allocator, request, upstream.contract());
+    const headers = try requestHeaders(arena_allocator, request, upstream);
     if (request.head.content_length) |length| {
         if (length > max_body_size) return error.StreamTooLong;
     }
@@ -26,7 +26,7 @@ pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, reque
     const reader = try request.readerExpectContinue(&.{});
     const body = try reader.allocRemaining(gpa, .limited(max_body_size));
     defer gpa.free(body);
-    const rewritten = try upstream.contract().rewriteRequest(gpa, arena_allocator, body, upstream.models);
+    const rewritten = try provider.rewriteRequest(gpa, arena_allocator, body, upstream.models);
 
     return .{ .request = request.*, .url = upstream.url, .body = rewritten, .headers = headers, .client = client };
 }
@@ -174,16 +174,16 @@ fn transferResponse(outgoing: *std.http.Client.Request, allocator: std.mem.Alloc
 
 /// arena_allocator must be arena-backed; partial lists and header copies are
 /// left for caller-owned bulk reclamation on error.
-fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, contract: Contract) ![]const std.http.Header {
+fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream) ![]const std.http.Header {
     var result: std.ArrayList(std.http.Header) = .empty;
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "authorization") or
             hopByHop(header.name, request.iterateHeaders()) or
-            !contract.allowsRequestHeader(header.name)) continue;
+            !provider.allowsRequestHeader(header.name)) continue;
         try result.append(arena_allocator, try copyHeader(arena_allocator, header));
     }
-    try result.appendSlice(arena_allocator, contract.requiredHeaders());
+    try result.appendSlice(arena_allocator, upstream.requiredHeaders());
     return result.toOwnedSlice(arena_allocator);
 }
 
@@ -359,7 +359,6 @@ test "transport preparation releases scratch before pending data is used" {
         .{ .body = "{\"model\":\"demo\",\"stream\":true,\"input\":[0,1,2]}" },
         .{ .body = "{\"model\":", .err = error.InvalidRequest },
         .{ .body = "{\"model\":\"unknown\",\"stream\":true}", .err = error.UnknownModel },
-        .{ .body = "{\"model\":\"demo\",\"stream\":false}", .err = error.InvalidRequest },
     };
     for (cases) |case| {
         const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nSession_id: session\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.body.len, case.body });
@@ -376,7 +375,7 @@ test "transport preparation releases scratch before pending data is used" {
             try std.testing.expectError(err, result);
         } else {
             const pending = try result;
-            try std.testing.expectEqualStrings("{\"model\":\"upstream-model\",\"stream\":true,\"input\":[0,1,2],\"store\":false}", pending.body);
+            try std.testing.expectEqualStrings("{\"model\":\"upstream-model\",\"stream\":true,\"input\":[0,1,2]}", pending.body);
             try std.testing.expectEqualStrings("session", pending.headers[0].value);
         }
         try std.testing.expect(scratch.allocations > 0);
@@ -384,20 +383,20 @@ test "transport preparation releases scratch before pending data is used" {
     }
 }
 
-test "transport applies the supplied provider contract without forwarding gateway auth or hop headers" {
+test "transport filters gateway auth and hop headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var reader = std.Io.Reader.fixed("POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer secret\r\nCookie: secret\r\nProxy-Authorization: secret\r\nSession_id: session\r\nOpenAI-Beta: responses=v1\r\nConnection: openai-beta\r\n\r\n");
+    var reader = std.Io.Reader.fixed("POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer secret\r\nCookie: secret\r\nProxy-Authorization: secret\r\nSession_id: session\r\nOpenAI-Beta: responses=v1\r\nAccept: private\r\nConnection: openai-beta, accept\r\n\r\n");
     var writer: std.Io.Writer.Discarding = .init(&.{});
     var http = std.http.Server.init(&reader, &writer.writer);
     var request = try http.receiveHead();
-    const headers = try requestHeaders(arena.allocator(), &request, .responses);
+    const headers = try requestHeaders(arena.allocator(), &request, .{ .url = "http://localhost/v1/responses", .models = .{} });
     try std.testing.expectEqual(1, headers.len);
     try std.testing.expectEqualStrings("Session_id", headers[0].name);
     try std.testing.expectEqualStrings("session", headers[0].value);
 }
 
-test "transport SIWC fixture enforces provider body and headers while preserving native fields" {
+test "transport SIWC fixture preserves native fields, client Accept, and stream events" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const native =
@@ -414,12 +413,12 @@ test "transport SIWC fixture enforces provider body and headers while preserving
     defer a.free(origin);
     const url = try std.fmt.allocPrint(a, "{s}/v1/responses", .{origin});
     defer a.free(url);
-    // Exercise the contract against loopback, without adding a production
+    // Exercise preparation against loopback, without adding a production
     // endpoint override. Provider.init separately proves pinning is mandatory.
     var upstream: Upstream = .{ .url = url, .models = .{}, .auth = .{ .provider = .codex } };
     defer upstream.models.deinit(a);
     try upstream.models.map.put(a, "demo", "fixture-model");
-    const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer gateway-secret\r\nCookie: private\r\nProxy-Authorization: private\r\nX-Api-Key: private\r\nAccept: application/json\r\nAccept: */*\r\nUser-Agent: private\r\nSession_id: session_1\r\nX-Request-Id: private\r\nConnection: x-request-id, accept\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
+    const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer gateway-secret\r\nCookie: private\r\nProxy-Authorization: private\r\nX-Api-Key: private\r\nAccept: application/json\r\nUser-Agent: private\r\nSession_id: session_1\r\nX-Request-Id: private\r\nConnection: x-request-id\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
     defer a.free(raw);
     var reader = std.Io.Reader.fixed(raw);
     var writer: std.Io.Writer.Allocating = .init(a);
@@ -440,14 +439,14 @@ test "transport SIWC fixture enforces provider body and headers while preserving
     try std.testing.expect(std.mem.find(u8, captured, "gateway-secret") == null);
     try std.testing.expect(std.mem.find(u8, captured, "private") == null);
     const body_start = std.mem.find(u8, captured, "\r\n\r\n").? + 4;
-    try std.testing.expectEqualStrings("{\"model\":\"fixture-model\",\"stream\":true" ++ native[0 .. native.len - 1] ++ ",\"store\":false}", captured[body_start..]);
+    try std.testing.expectEqualStrings("{\"model\":\"fixture-model\",\"stream\":true" ++ native, captured[body_start..]);
     var captured_reader = std.Io.Reader.fixed(captured);
     var discard: std.Io.Writer.Discarding = .init(&.{});
     var upstream_http = std.http.Server.init(&captured_reader, &discard.writer);
     const received = try upstream_http.receiveHead();
     const expected = [_]std.http.Header{
         .{ .name = "authorization", .value = "Bearer fixture-access" },
-        .{ .name = "accept", .value = "text/event-stream" },
+        .{ .name = "accept", .value = "application/json" },
         .{ .name = "user-agent", .value = "fumo-gateway" },
         .{ .name = "content-type", .value = "application/json" },
         .{ .name = "accept-encoding", .value = "identity" },

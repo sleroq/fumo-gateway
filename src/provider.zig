@@ -22,7 +22,7 @@ pub const Upstream = struct {
         const host = uri.host orelse return error.InvalidUpstreamUrl;
         if (host.isEmpty() or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidUpstreamUrl;
         if (uri.port == 0) return error.InvalidUpstreamUrl;
-        try self.contract().validateEndpoint(self.url);
+        try self.validateEndpoint();
         if (self.auth) |*options| {
             if (options.credentials_dir) |directory| {
                 if (std.mem.trim(u8, directory, " \t\r\n").len == 0) return error.InvalidDirectory;
@@ -37,8 +37,12 @@ pub const Upstream = struct {
         }
     }
 
-    pub fn contract(self: Upstream) Contract {
-        return if (self.auth != null) .siwc else .responses;
+    fn validateEndpoint(self: Upstream) !void {
+        if (self.auth != null and !std.mem.eql(u8, self.url, siwc_responses_url)) return error.InvalidCodexEndpoint;
+    }
+
+    pub fn requiredHeaders(self: Upstream) []const std.http.Header {
+        return if (self.auth != null) &.{.{ .name = "user-agent", .value = "fumo-gateway" }} else &.{};
     }
 };
 
@@ -49,7 +53,7 @@ pub const Provider = struct {
     session: ?Session = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, upstream: Upstream) !Provider {
-        try upstream.contract().validateEndpoint(upstream.url);
+        try upstream.validateEndpoint();
         return .{
             .upstream = upstream,
             .session = if (upstream.auth) |options| try Session.init(allocator, io, options.credentials_dir.?) else null,
@@ -67,63 +71,30 @@ pub const Provider = struct {
     }
 };
 
-pub const Contract = enum {
-    responses,
-    siwc,
-
-    fn validateEndpoint(self: Contract, url: []const u8) !void {
-        if (self == .siwc and !std.mem.eql(u8, url, siwc_responses_url)) return error.InvalidCodexEndpoint;
+pub fn allowsRequestHeader(name: []const u8) bool {
+    for ([_][]const u8{ "accept", "x-request-id", "openai-beta", "session_id", "conversation_id", "x-codex-turn-metadata", "x-codex-turn-state" }) |allowed| {
+        if (std.ascii.eqlIgnoreCase(name, allowed)) return true;
     }
+    return false;
+}
 
-    pub fn allowsRequestHeader(self: Contract, name: []const u8) bool {
-        if (std.ascii.eqlIgnoreCase(name, "accept")) return self == .responses;
-        for ([_][]const u8{ "x-request-id", "openai-beta", "session_id", "conversation_id", "x-codex-turn-metadata", "x-codex-turn-state" }) |allowed| {
-            if (std.ascii.eqlIgnoreCase(name, allowed)) return true;
-        }
-        return false;
-    }
+/// gpa must reclaim scratch on free; allocator owns only the returned body.
+pub fn rewriteRequest(gpa: std.mem.Allocator, allocator: std.mem.Allocator, body: []const u8, models: std.json.ArrayHashMap([]const u8)) ![]u8 {
+    try validateRequestDepth(gpa, body);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidRequest,
+    };
+    defer parsed.deinit();
+    var value = parsed.value;
+    if (value != .object) return error.InvalidRequest;
+    const model = value.object.getPtr("model") orelse return error.InvalidRequest;
+    if (model.* != .string) return error.InvalidRequest;
+    const mapped = models.map.get(model.string) orelse return error.UnknownModel;
+    model.* = .{ .string = mapped };
 
-    pub fn requiredHeaders(self: Contract) []const std.http.Header {
-        return switch (self) {
-            .responses => &.{},
-            .siwc => &.{
-                .{ .name = "accept", .value = "text/event-stream" },
-                .{ .name = "user-agent", .value = "fumo-gateway" },
-            },
-        };
-    }
-
-    /// gpa must reclaim scratch on free; allocator owns only the returned body.
-    pub fn rewriteRequest(self: Contract, gpa: std.mem.Allocator, allocator: std.mem.Allocator, body: []const u8, models: std.json.ArrayHashMap([]const u8)) ![]u8 {
-        try validateRequestDepth(gpa, body);
-        const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .parse_numbers = false }) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.InvalidRequest,
-        };
-        defer parsed.deinit();
-        var value = parsed.value;
-        if (value != .object) return error.InvalidRequest;
-        const model = value.object.getPtr("model") orelse return error.InvalidRequest;
-        if (model.* != .string) return error.InvalidRequest;
-        const mapped = models.map.get(model.string) orelse return error.UnknownModel;
-        model.* = .{ .string = mapped };
-
-        if (self == .siwc) {
-            const stream = value.object.get("stream") orelse return error.InvalidRequest;
-            if (stream != .bool or !stream.bool) return error.InvalidRequest;
-            if (value.object.get("store")) |store| {
-                if (store != .bool or store.bool) return error.InvalidRequest;
-            }
-            // Deliberately reject, rather than silently drop, caller controls.
-            // This is our narrow SIWC contract, not general OpenAI validation.
-            for (siwc_unsupported_fields) |field| {
-                if (value.object.contains(field)) return error.InvalidRequest;
-            }
-            try value.object.put(parsed.arena.allocator(), "store", .{ .bool = false });
-        }
-        return std.json.Stringify.valueAlloc(allocator, value, .{});
-    }
-};
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
+}
 
 // Scan tokens before building the value tree so excessive nesting never reaches
 // recursive serialization. The scanner handles quoted/escaped delimiters for us.
@@ -140,30 +111,20 @@ fn validateRequestDepth(allocator: std.mem.Allocator, body: []const u8) !void {
     }
 }
 
-// Compatibility exclusions observed in CLIProxyAPI's SIWC body rules. Other
-// native fields are preserved; we do not adopt its translators or ID/cache edits.
-const siwc_unsupported_fields = [_][]const u8{
-    "temperature", "max_output_tokens", "max_completion_tokens", "prompt_cache_retention", "prompt_cache_options",
-};
-
-test "provider Responses header contract excludes credentials and transport-owned headers" {
-    for ([_]Contract{ .responses, .siwc }) |contract| {
-        for ([_][]const u8{ "X-Request-Id", "OpenAI-Beta", "Session_id", "Conversation_id", "X-Codex-Turn-Metadata", "X-Codex-Turn-State" }) |name| {
-            try std.testing.expect(contract.allowsRequestHeader(name));
-        }
-        for ([_][]const u8{ "Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "Api-Key", "Host", "Content-Length", "Connection", "User-Agent", "X-Unrecognized" }) |name| {
-            try std.testing.expect(!contract.allowsRequestHeader(name));
-        }
+test "provider Responses header allowlist excludes credentials and transport-owned headers" {
+    for ([_][]const u8{ "Accept", "X-Request-Id", "OpenAI-Beta", "Session_id", "Conversation_id", "X-Codex-Turn-Metadata", "X-Codex-Turn-State" }) |name| {
+        try std.testing.expect(allowsRequestHeader(name));
     }
-    try std.testing.expect(Contract.responses.allowsRequestHeader("Accept"));
-    try std.testing.expect(!Contract.siwc.allowsRequestHeader("Accept"));
+    for ([_][]const u8{ "Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "Api-Key", "Host", "Content-Length", "Connection", "User-Agent", "X-Unrecognized" }) |name| {
+        try std.testing.expect(!allowsRequestHeader(name));
+    }
 }
 
 test "provider model rewrite preserves native request fields" {
     var models: std.json.ArrayHashMap([]const u8) = .{};
     defer models.deinit(std.testing.allocator);
     try models.map.put(std.testing.allocator, "demo", "upstream-model");
-    const body = try Contract.responses.rewriteRequest(std.testing.allocator, std.testing.allocator,
+    const body = try rewriteRequest(std.testing.allocator, std.testing.allocator,
         \\{"model":"demo","input":[{"type":"function_call_output","call_id":"123","output":"ok"}],"stream":false,"store":true,"temperature":0.5,"max_output_tokens":99,"reasoning":{"effort":"high"},"previous_response_id":"resp_1","metadata":{"precise":18446744073709551617}}
     , models);
     defer std.testing.allocator.free(body);
@@ -178,40 +139,38 @@ test "provider model rewrite preserves native request fields" {
     try std.testing.expect(value.object.get("store").?.bool);
     try std.testing.expectEqual(@as(i64, 99), value.object.get("max_output_tokens").?.integer);
     try std.testing.expectEqual(@as(f64, 0.5), value.object.get("temperature").?.float);
-    try std.testing.expectError(error.UnknownModel, Contract.responses.rewriteRequest(std.testing.allocator, std.testing.allocator, "{\"model\":\"unknown\"}", models));
+    try std.testing.expectError(error.UnknownModel, rewriteRequest(std.testing.allocator, std.testing.allocator, "{\"model\":\"unknown\"}", models));
     for ([_][]const u8{ "invalid", "[]", "{}", "{\"model\":1}" }) |invalid| {
-        try std.testing.expectError(error.InvalidRequest, Contract.responses.rewriteRequest(std.testing.allocator, std.testing.allocator, invalid, models));
+        try std.testing.expectError(error.InvalidRequest, rewriteRequest(std.testing.allocator, std.testing.allocator, invalid, models));
     }
 }
 
-test "provider request depth bounds arrays, objects, and mixed containers for both contracts" {
+test "provider request depth bounds arrays, objects, and mixed containers" {
     const a = std.testing.allocator;
     var models: std.json.ArrayHashMap([]const u8) = .{};
     defer models.deinit(a);
     try models.map.put(a, "demo", "upstream-model");
-    for ([_]Contract{ .responses, .siwc }) |contract| {
-        for ([_]enum { arrays, objects, mixed }{ .arrays, .objects, .mixed }) |kind| {
-            for ([_]usize{ max_request_depth, max_request_depth + 1, 301 }) |depth| {
-                var input: std.Io.Writer.Allocating = .init(a);
-                defer input.deinit();
-                try input.writer.writeAll("{\"model\":\"demo\",\"stream\":true,\"input\":");
-                for (1..depth) |level| {
-                    try input.writer.writeAll(if (kind == .objects or (kind == .mixed and level % 2 == 0)) "{\"nested\":" else "[");
-                }
-                try input.writer.writeAll("null");
-                var level = depth;
-                while (level > 1) {
-                    level -= 1;
-                    try input.writer.writeAll(if (kind == .objects or (kind == .mixed and level % 2 == 0)) "}" else "]");
-                }
-                try input.writer.writeAll("}");
-                if (depth > max_request_depth) {
-                    try std.testing.expectError(error.InvalidRequest, contract.rewriteRequest(a, a, input.written(), models));
-                } else {
-                    const body = try contract.rewriteRequest(a, a, input.written(), models);
-                    defer a.free(body);
-                    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
-                }
+    for ([_]enum { arrays, objects, mixed }{ .arrays, .objects, .mixed }) |kind| {
+        for ([_]usize{ max_request_depth, max_request_depth + 1, 301 }) |depth| {
+            var input: std.Io.Writer.Allocating = .init(a);
+            defer input.deinit();
+            try input.writer.writeAll("{\"model\":\"demo\",\"stream\":true,\"input\":");
+            for (1..depth) |level| {
+                try input.writer.writeAll(if (kind == .objects or (kind == .mixed and level % 2 == 0)) "{\"nested\":" else "[");
+            }
+            try input.writer.writeAll("null");
+            var level = depth;
+            while (level > 1) {
+                level -= 1;
+                try input.writer.writeAll(if (kind == .objects or (kind == .mixed and level % 2 == 0)) "}" else "]");
+            }
+            try input.writer.writeAll("}");
+            if (depth > max_request_depth) {
+                try std.testing.expectError(error.InvalidRequest, rewriteRequest(a, a, input.written(), models));
+            } else {
+                const body = try rewriteRequest(a, a, input.written(), models);
+                defer a.free(body);
+                try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
             }
         }
     }
@@ -232,33 +191,9 @@ test "provider request depth ignores string delimiters and counts nesting rather
     try input.writer.writeAll("\"");
     for (0..300) |_| try input.writer.writeAll(",[{},[]]");
     try input.writer.writeAll("]}");
-    const body = try Contract.responses.rewriteRequest(a, a, input.written(), models);
+    const body = try rewriteRequest(a, a, input.written(), models);
     defer a.free(body);
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
-}
-
-test "provider SIWC requires streaming, disables storage, and rejects unsupported controls" {
-    const a = std.testing.allocator;
-    var models: std.json.ArrayHashMap([]const u8) = .{};
-    defer models.deinit(a);
-    try models.map.put(a, "demo", "upstream-model");
-    for ([_][]const u8{ "", ",\"store\":false" }) |store| {
-        const input = try std.fmt.allocPrint(a, "{{\"model\":\"demo\",\"stream\":true{s}}}", .{store});
-        defer a.free(input);
-        const body = try Contract.siwc.rewriteRequest(a, a, input, models);
-        defer a.free(body);
-        try std.testing.expectEqualStrings("{\"model\":\"upstream-model\",\"stream\":true,\"store\":false}", body);
-    }
-    for ([_][]const u8{ "", ",\"stream\":false", ",\"stream\":null", ",\"stream\":\"true\"", ",\"stream\":true,\"store\":true", ",\"stream\":true,\"store\":null" }) |fields| {
-        const input = try std.fmt.allocPrint(a, "{{\"model\":\"demo\"{s}}}", .{fields});
-        defer a.free(input);
-        try std.testing.expectError(error.InvalidRequest, Contract.siwc.rewriteRequest(a, a, input, models));
-    }
-    for (siwc_unsupported_fields) |field| {
-        const input = try std.fmt.allocPrint(a, "{{\"model\":\"demo\",\"stream\":true,\"{s}\":null}}", .{field});
-        defer a.free(input);
-        try std.testing.expectError(error.InvalidRequest, Contract.siwc.rewriteRequest(a, a, input, models));
-    }
 }
 
 test "provider credential initialization cannot bypass endpoint pinning" {
