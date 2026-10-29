@@ -18,6 +18,10 @@ pub const Credentials = struct {
             if (std.mem.trim(u8, @field(self, field), " \t\r\n\x0b\x0c").len == 0)
                 return error.InvalidCredentials;
         }
+        // Access tokens are inserted into an HTTP Bearer header by the service.
+        for (self.access_token) |byte| {
+            if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return error.InvalidCredentials;
+        }
         if (self.expires_at <= 0) return error.InvalidCredentials;
         var scopes = std.mem.tokenizeAny(u8, self.scope, " \t\r\n\x0b\x0c");
         while (scopes.next()) |scope| {
@@ -160,6 +164,11 @@ test "required values and expiry" {
     invalid = example;
     invalid.expires_at = 0;
     try std.testing.expectError(error.InvalidCredentials, invalid.validate());
+    for ([_][]const u8{ "access token", "access\ttoken", "access\r\nx-header: value", "access\x00", "access\x7f" }) |token| {
+        invalid = example;
+        invalid.access_token = token;
+        try std.testing.expectError(error.InvalidCredentials, invalid.validate());
+    }
 }
 
 test "default state paths" {

@@ -84,8 +84,8 @@ pub const Login = struct {
     }
 };
 
-/// One explicit refresh, without retries. Automatic inference-time refresh and
-/// coordination belong to the future running credential owner, not this command.
+/// One SIWC refresh exchange, shared by the explicit command and service-owned
+/// credential session. The caller owns retries, persistence, and coordination.
 pub const Refresh = struct {
     http: std.http.Client,
     origin: []const u8 = auth_origin,
@@ -96,13 +96,14 @@ pub const Refresh = struct {
         defer current.deinit();
         var arena = std.heap.ArenaAllocator.init(self.http.allocator);
         defer arena.deinit();
-        const credentials = try self.refreshWithDeadline(arena.allocator(), current.value);
+        const credentials = try self.exchange(arena.allocator(), current.value);
         // Saving is the commit, outside the network deadline, just as for login.
         try storage.save(self.http.allocator, self.http.io, directory, credentials);
         showSuccess(self.http.io, "SIWC credentials refreshed.\n") catch {};
     }
 
-    fn refreshWithDeadline(self: *Refresh, allocator: std.mem.Allocator, current: storage.Credentials) !storage.Credentials {
+    /// Bounded network exchange only; returned credentials belong to allocator.
+    pub fn exchange(self: *Refresh, allocator: std.mem.Allocator, current: storage.Credentials) !storage.Credentials {
         const io = self.http.io;
         const deadline = std.Io.Clock.Timestamp.fromNow(io, self.timeout);
         var completed: std.Io.Semaphore = .{};
@@ -313,5 +314,205 @@ test "token expiry must be a positive JSON integer without timestamp overflow" {
     for ([_][]const u8{ "\"3600\"", "null", "true", "3600.5", "0", "-1", "9223372036854775807" }) |expiry| {
         const body = try std.fmt.allocPrint(allocator, "{{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"id_token\":\"id\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":{s}}}", .{expiry});
         try std.testing.expectError(error.InvalidTokenExpiry, parseCredentials(allocator, body, "client", "device", 100, null));
+    }
+}
+
+// Network contracts live here so the login test can supply the private PKCE
+// state directly, without capturing process-global stdout or launching a CLI.
+const AuthFixture = @import("fixture").Fixture;
+const auth_test_tokens = "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"id_token\":\"new-id\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":1234}";
+const auth_test_current: storage.Credentials = .{
+    .access_token = "old-access",
+    .refresh_token = "old-refresh +/&=?%",
+    .id_token = "old-id",
+    .client_id = "issued-client",
+    .device_id = "device",
+    .scope = "chatgpt.tokens.use.direct",
+    .expires_at = 1700003600,
+    .obtained_at = 1700000000,
+};
+
+fn authTestReply(allocator: std.mem.Allocator, status: []const u8, body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, body.len, body });
+}
+
+fn authTestCallback(io: std.Io, uri: []const u8, state: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const url = try std.fmt.allocPrint(arena.allocator(), "{s}?state={s}&code=code%20%2B%2F%26%3D%3F%25&client_id=issued-client", .{ uri, state });
+    var http: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer http.deinit();
+    var request = try http.request(.GET, try std.Uri.parse(url), .{ .keep_alive = false });
+    defer request.deinit();
+    try request.sendBodiless();
+    const response = try request.receiveHead(&.{});
+    try std.testing.expectEqual(std.http.Status.ok, response.head.status);
+}
+
+fn authTestPrivate(dir: std.Io.Dir) !void {
+    const io = std.testing.io;
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), (try dir.stat(io)).permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (try dir.statFile(io, "codex.json", .{})).permissions.toMode() & 0o777);
+    var iterator = dir.iterate();
+    const entry = (try iterator.next(io)).?;
+    try std.testing.expectEqualStrings("codex.json", entry.name);
+    try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try iterator.next(io));
+}
+
+test "login callback exchanges issued grant and commits private replacement" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const reply = try authTestReply(a, "200 OK", auth_test_tokens);
+    defer a.free(reply);
+    var fixture = try AuthFixture.init(a, io, &.{.{ .bytes = reply }});
+    defer fixture.deinit();
+    try fixture.start();
+    const origin = try fixture.origin(a);
+    defer a.free(origin);
+    var login_test: Login = .{ .http = .{ .allocator = a, .io = io }, .origin = origin, .timeout = .{ .raw = .fromSeconds(2), .clock = .awake } };
+    defer login_test.http.deinit();
+    var callback = try Callback.listen(io, 0);
+    defer callback.deinit(io);
+    const uri = try callback.redirectUri(a);
+    defer a.free(uri);
+    const authorization = try Authorization.init(io);
+    var browser = try io.concurrent(authTestCallback, .{ io, uri, &authorization.state });
+    defer _ = browser.cancel(io) catch {};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const credentials = try login_test.authorizeWithDeadline(arena.allocator(), &callback, authorization, uri);
+    try browser.await(io);
+    try fixture.waitRequest();
+    const expected = try encodeParameters(a, &.{
+        .{ .name = "grant_type", .value = "authorization_code" },
+        .{ .name = "client_id", .value = "issued-client" },
+        .{ .name = "code", .value = "code +/&=?%" },
+        .{ .name = "code_verifier", .value = &authorization.verifier },
+        .{ .name = "redirect_uri", .value = uri },
+        .{ .name = "resource", .value = resource },
+    });
+    defer a.free(expected);
+    try authTestRequest(fixture.requests[0].?, expected);
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(io, .fromMode(0o700));
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    try storage.save(a, io, path, auth_test_current);
+    try storage.save(a, io, path, credentials);
+    const saved = try storage.load(a, io, path);
+    defer saved.deinit();
+    try std.testing.expectEqualStrings("new-access", saved.value.access_token);
+    try std.testing.expectEqualStrings("issued-client", saved.value.client_id);
+    try std.testing.expectEqualStrings(&authorization.device_id, saved.value.device_id);
+    try std.testing.expectEqual(@as(i64, 1234), saved.value.expires_at - saved.value.obtained_at);
+    try authTestPrivate(tmp.dir);
+}
+
+fn authTestRequest(raw: []const u8, body: []const u8) !void {
+    try std.testing.expect(std.mem.startsWith(u8, raw, "POST /api/accounts/oauth/token HTTP/1.1\r\n"));
+    try std.testing.expect(std.ascii.findIgnoreCase(raw, "content-type: application/x-www-form-urlencoded\r\n") != null);
+    const start = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+    try std.testing.expectEqualStrings(body, raw[start..]);
+}
+
+test "refresh rotates credentials and preserves bytes on HTTP parse and timeout failures without retry" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { status: []const u8 = "200 OK", body: []const u8, failure: ?anyerror = null, stall: bool = false };
+    for ([_]Case{
+        .{ .body = auth_test_tokens },
+        .{ .body = "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_in\":1234}" },
+        .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_grant\"}", .failure = error.ReauthenticationRequired },
+        .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_client\"}", .failure = error.TokenRefreshFailed },
+        .{ .status = "302 Found", .body = "", .failure = error.TokenRefreshFailed },
+        .{ .body = "not json", .failure = error.SyntaxError },
+        .{ .body = "", .stall = true, .failure = error.RefreshTimedOut },
+    }) |case| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try tmp.dir.setPermissions(io, .fromMode(0o700));
+        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        try storage.save(a, io, path, auth_test_current);
+        const original = try tmp.dir.readFileAlloc(io, "codex.json", a, .limited(4096));
+        defer a.free(original);
+        const reply = try authTestReply(a, case.status, case.body);
+        defer a.free(reply);
+        var gate: std.Io.Semaphore = .{};
+        var fixture = try AuthFixture.init(a, io, &.{.{ .bytes = if (case.stall) "" else reply, .gate = if (case.stall) &gate else null }});
+        defer fixture.deinit();
+        try fixture.start();
+        const origin = try fixture.origin(a);
+        defer a.free(origin);
+        var refresh_test: Refresh = .{ .http = .{ .allocator = a, .io = io }, .origin = origin, .timeout = .{ .raw = .fromMilliseconds(250), .clock = .awake } };
+        defer refresh_test.http.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, refresh_test.exchange(arena.allocator(), auth_test_current));
+            const after = try tmp.dir.readFileAlloc(io, "codex.json", a, .limited(4096));
+            defer a.free(after);
+            try std.testing.expectEqualStrings(original, after);
+        } else {
+            const rotated = try refresh_test.exchange(arena.allocator(), auth_test_current);
+            try storage.save(a, io, path, rotated);
+            const saved = try storage.load(a, io, path);
+            defer saved.deinit();
+            try std.testing.expectEqualStrings("new-access", saved.value.access_token);
+            try std.testing.expectEqualStrings("new-refresh", saved.value.refresh_token);
+            try std.testing.expectEqualStrings(if (std.mem.indexOf(u8, case.body, "id_token") != null) "new-id" else "old-id", saved.value.id_token);
+            try std.testing.expectEqualStrings(auth_test_current.client_id, saved.value.client_id);
+            try std.testing.expectEqualStrings(auth_test_current.device_id, saved.value.device_id);
+            try std.testing.expectEqual(@as(i64, 1234), saved.value.expires_at - saved.value.obtained_at);
+        }
+        try fixture.waitRequest();
+        try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
+        try authTestRequest(fixture.requests[0].?, "grant_type=refresh_token&client_id=issued-client&refresh_token=old-refresh%20%2B%2F%26%3D%3F%25&resource=https%3A%2F%2Fapi.openai.com%2Fv1");
+        try authTestPrivate(tmp.dir);
+    }
+}
+
+test "login deadline cancels idle callback partial headers and stalled exchange" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (0..3) |phase| {
+        var gate: std.Io.Semaphore = .{};
+        var fixture = try AuthFixture.init(a, io, &.{.{ .bytes = "", .gate = &gate }});
+        defer fixture.deinit();
+        try fixture.start();
+        const origin = try fixture.origin(a);
+        defer a.free(origin);
+        var auth: Login = .{ .http = .{ .allocator = a, .io = io }, .origin = origin, .timeout = .{ .raw = .fromMilliseconds(250), .clock = .awake } };
+        defer auth.http.deinit();
+        var callback = try Callback.listen(io, 0);
+        defer callback.deinit(io);
+        const uri = try callback.redirectUri(a);
+        defer a.free(uri);
+        const authorization = try Authorization.init(io);
+        const partial = if (phase == 1) try callback.server.socket.address.connect(io, .{ .mode = .stream }) else null;
+        defer if (partial) |stream| stream.close(io);
+        if (partial) |stream| {
+            var buffer: [128]u8 = undefined;
+            var writer = stream.writer(io, &buffer);
+            try writer.interface.writeAll("GET /auth/callback HTTP/1.1\r\nHost: localhost\r\n");
+            try writer.interface.flush();
+        }
+        var browser = if (phase == 2) try io.concurrent(authTestCallback, .{ io, uri, &authorization.state }) else null;
+        defer {
+            if (browser) |*task| {
+                _ = task.cancel(io) catch {};
+            }
+        }
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const before = std.Io.Clock.awake.now(io);
+        try std.testing.expectError(error.LoginTimedOut, auth.authorizeWithDeadline(arena.allocator(), &callback, authorization, uri));
+        try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+        // The deadline may win before the callback is accepted under load.
+        // Never await a browser request after its server task was canceled.
+        if (browser) |*task| _ = task.cancel(io) catch {};
+        if (phase == 2) try fixture.waitRequest();
+        try std.testing.expectEqual(@as(usize, if (phase == 2) 1 else 0), fixture.count.load(.acquire));
     }
 }

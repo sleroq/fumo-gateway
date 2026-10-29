@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// SIWC direct-token credentials are sent only to this approved endpoint.
+pub const siwc_responses_url = "https://api.openai.com/v1/responses";
+
 pub const Provider = struct {
     request_headers: []const []const u8,
 

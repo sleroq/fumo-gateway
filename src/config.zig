@@ -1,9 +1,15 @@
 const std = @import("std");
 const auth = @import("auth.zig");
+const credentials = @import("codex/credentials.zig");
+const provider = @import("provider.zig");
 
 pub const Upstream = struct {
     url: []const u8,
     models: std.json.ArrayHashMap([]const u8),
+    auth: ?struct {
+        provider: enum { codex },
+        credentials_dir: ?[]const u8 = null,
+    } = null,
 
     fn validate(self: Upstream) !void {
         const uri = std.Uri.parse(self.url) catch return error.InvalidUpstreamUrl;
@@ -11,6 +17,12 @@ pub const Upstream = struct {
         const host = uri.host orelse return error.InvalidUpstreamUrl;
         if (host.isEmpty() or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidUpstreamUrl;
         if (uri.port == 0) return error.InvalidUpstreamUrl;
+        if (self.auth) |options| {
+            if (!std.mem.eql(u8, self.url, provider.siwc_responses_url)) return error.InvalidCodexEndpoint;
+            if (options.credentials_dir) |directory| {
+                if (std.mem.trim(u8, directory, " \t\r\n").len == 0) return error.InvalidDirectory;
+            }
+        }
         if (self.models.map.count() == 0) return error.NoUpstreamModels;
         for (self.models.map.keys(), self.models.map.values()) |alias, model| {
             if (alias.len == 0) return error.EmptyModelAlias;
@@ -43,7 +55,13 @@ pub const Config = struct {
         const allocator = arena.allocator();
 
         const document = try std.json.parseFromSliceLeaky(Document, allocator, text, .{ .allocate = .alloc_always });
-        if (document.upstream) |upstream| try upstream.validate();
+        var upstream = document.upstream;
+        if (upstream) |*value| {
+            try value.validate();
+            if (value.auth) |*options| {
+                if (options.credentials_dir == null) options.credentials_dir = try credentials.defaultDirectory(allocator, environ);
+            }
+        }
         const address = std.Io.net.IpAddress.parseLiteral(document.listen) catch return error.InvalidListenAddress;
         if (address.getPort() == 0) return error.InvalidListenAddress;
         if (document.clients.map.count() == 0) return error.NoClients;
@@ -65,7 +83,7 @@ pub const Config = struct {
             }
         }
 
-        return .{ .arena = arena, .address = address, .clients = clients, .upstream = document.upstream };
+        return .{ .arena = arena, .address = address, .clients = clients, .upstream = upstream };
     }
 
     pub fn deinit(self: *Config) void {
@@ -128,6 +146,34 @@ test "upstream preserves endpoint and model aliases in its arena" {
     try std.testing.expectEqualStrings("http://127.0.0.1:9090/v1/responses", upstream.url);
     try std.testing.expectEqualStrings("fixture-model", upstream.models.map.get("demo").?);
     try std.testing.expectEqualStrings("second-model", upstream.models.map.get("other").?);
+}
+
+test "SIWC configuration resolves private storage and pins the credential destination" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("PI_KEY", "secret");
+    try environ.put("HOME", "/home/test");
+    var config = try Config.parse(std.testing.allocator,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"https://api.openai.com/v1/responses","models":{"demo":"model"},"auth":{"provider":"codex"}}}
+    , &environ);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("/home/test/.local/state/fumo-gateway", config.upstream.?.auth.?.credentials_dir.?);
+    const explicit =
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"https://api.openai.com/v1/responses","models":{"demo":"model"},"auth":{"provider":"codex","credentials_dir":"/private/credentials"}}}
+    ;
+    var configured = try Config.parse(std.testing.allocator, explicit, &environ);
+    defer configured.deinit();
+    try std.testing.expectEqualStrings("/private/credentials", configured.upstream.?.auth.?.credentials_dir.?);
+    for ([_][]const u8{ "http://api.openai.com/v1/responses", "https://example.com/v1/responses", "https://api.openai.com/other", "https://api.openai.com:443/v1/responses" }) |url| {
+        const text = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"{s}","models":{{"demo":"model"}},"auth":{{"provider":"codex"}}}}}}
+        , .{url});
+        defer std.testing.allocator.free(text);
+        try std.testing.expectError(error.InvalidCodexEndpoint, Config.parse(std.testing.allocator, text, &environ));
+    }
+    try std.testing.expectError(error.InvalidDirectory, Config.parse(std.testing.allocator,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"https://api.openai.com/v1/responses","models":{"demo":"model"},"auth":{"provider":"codex","credentials_dir":""}}}
+    , &environ));
 }
 
 test "invalid upstream configuration is rejected" {

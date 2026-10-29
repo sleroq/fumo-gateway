@@ -9,6 +9,7 @@ pub const Pending = struct {
     body: []u8,
     headers: []const std.http.Header,
     client: []const u8,
+    authorization: ?[]const u8 = null,
 };
 
 /// Capture headers before reading the body invalidates the HTTP head buffer.
@@ -90,7 +91,7 @@ fn relayResponse(io: std.Io, allocator: std.mem.Allocator, upstream: Upstream, p
         .keep_alive = false,
         .redirect_behavior = .unhandled,
         .headers = .{
-            .authorization = .omit,
+            .authorization = if (pending.authorization) |value| .{ .override = value } else .omit,
             .user_agent = .omit,
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .{ .override = "identity" },
@@ -143,6 +144,8 @@ fn relayResponse(io: std.Io, allocator: std.mem.Allocator, upstream: Upstream, p
         try body.flush();
     }
 
+    if (body.state == .content_length and body.state.content_length != 0)
+        return error.TruncatedUpstreamResponse;
     try body.end();
 
     return status;
