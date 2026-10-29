@@ -46,6 +46,8 @@ pub const Login = struct {
         showSuccess(io, "SIWC credentials saved.\n") catch {};
     }
 
+    /// allocator must be arena-backed and outlive the returned credentials.
+    /// The caller reclaims all authorization state, including on error.
     fn authorizeWithDeadline(self: *Login, allocator: std.mem.Allocator, callback: *Callback, authorization: Authorization, redirect_uri: []const u8) !storage.Credentials {
         const io = self.http.io;
         const deadline = std.Io.Clock.Timestamp.fromNow(io, self.timeout);
@@ -102,12 +104,14 @@ pub const Refresh = struct {
         showSuccess(self.http.io, "SIWC credentials refreshed.\n") catch {};
     }
 
-    /// Bounded network exchange only; returned credentials belong to allocator.
-    pub fn exchange(self: *Refresh, allocator: std.mem.Allocator, current: storage.Credentials) !storage.Credentials {
+    /// Bounded network exchange only. arena_allocator must be arena-backed.
+    /// Credentials and intermediate request/response/parsing allocations share
+    /// its lifetime. The caller reclaims the arena after use, including on error.
+    pub fn exchange(self: *Refresh, arena_allocator: std.mem.Allocator, current: storage.Credentials) !storage.Credentials {
         const io = self.http.io;
         const deadline = std.Io.Clock.Timestamp.fromNow(io, self.timeout);
         var completed: std.Io.Semaphore = .{};
-        var task = try io.concurrent(request, .{ self, allocator, current, &completed });
+        var task = try io.concurrent(request, .{ self, arena_allocator, current, &completed });
         defer {
             if (task.cancel(io)) |_| {} else |_| {}
         }
@@ -118,6 +122,7 @@ pub const Refresh = struct {
         return try task.await(io);
     }
 
+    /// allocator is the exchange caller's arena for credentials and intermediates.
     fn request(self: *Refresh, allocator: std.mem.Allocator, current: storage.Credentials, completed: *std.Io.Semaphore) !storage.Credentials {
         defer completed.post(self.http.io);
         const body = try encodeParameters(allocator, &.{
@@ -141,8 +146,10 @@ const TokenReply = struct { status: std.http.Status, body: []u8 };
 
 /// Login and refresh share the SIWC endpoint, limits, and redirect policy.
 /// Neither request nor response bodies may appear in diagnostics.
-fn postTokens(http: *std.http.Client, origin: []const u8, allocator: std.mem.Allocator, body: []u8) !TokenReply {
-    const url = try std.fmt.allocPrint(allocator, "{s}/api/accounts/oauth/token", .{origin});
+/// arena_allocator must be arena-backed; the URL and response body are left
+/// for caller-owned bulk reclamation, including on error.
+fn postTokens(http: *std.http.Client, origin: []const u8, arena_allocator: std.mem.Allocator, body: []u8) !TokenReply {
+    const url = try std.fmt.allocPrint(arena_allocator, "{s}/api/accounts/oauth/token", .{origin});
     var request = try http.request(.POST, try std.Uri.parse(url), .{
         .keep_alive = false,
         .redirect_behavior = .unhandled,
@@ -162,7 +169,7 @@ fn postTokens(http: *std.http.Client, origin: []const u8, allocator: std.mem.All
         response = try request.receiveHead(&.{});
     }
     const status = response.head.status;
-    return .{ .status = status, .body = try response.reader(&.{}).allocRemaining(allocator, .limited(1024 * 1024)) };
+    return .{ .status = status, .body = try response.reader(&.{}).allocRemaining(arena_allocator, .limited(1024 * 1024)) };
 }
 
 const Authorization = struct {
@@ -232,6 +239,8 @@ fn deviceId(io: std.Io) ![36]u8 {
     return uuid;
 }
 
+/// allocator must be arena-backed; parsed JSON and partial credentials are
+/// reclaimed with the arena, not individually, including on error.
 fn parseCredentials(allocator: std.mem.Allocator, body: []const u8, client_id: []const u8, device_id: []const u8, now: i64, previous_id_token: ?[]const u8) !storage.Credentials {
     // Match CLIProxyAPI's SIWC contract: ID tokens are opaque credentials from the
     // HTTPS token endpoint, not locally verified identities or gateway client keys.

@@ -13,10 +13,12 @@ pub const Pending = struct {
     authorization: ?[]const u8 = null,
 };
 
-/// gpa reclaims input/parsing scratch before return; allocator owns pending data.
+/// gpa must reclaim scratch on free; input/parsing scratch is released before return.
+/// arena_allocator must be arena-backed. The caller reclaims pending body/header
+/// allocations after forwarding, or partial allocations on any preparation error.
 /// Capture headers before reading the body invalidates the HTTP head buffer.
-pub fn prepare(gpa: std.mem.Allocator, allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
-    const headers = try requestHeaders(allocator, request, upstream.contract());
+pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
+    const headers = try requestHeaders(arena_allocator, request, upstream.contract());
     if (request.head.content_length) |length| {
         if (length > max_body_size) return error.StreamTooLong;
     }
@@ -24,7 +26,7 @@ pub fn prepare(gpa: std.mem.Allocator, allocator: std.mem.Allocator, request: *s
     const reader = try request.readerExpectContinue(&.{});
     const body = try reader.allocRemaining(gpa, .limited(max_body_size));
     defer gpa.free(body);
-    const rewritten = try upstream.contract().rewriteRequest(gpa, allocator, body, upstream.models);
+    const rewritten = try upstream.contract().rewriteRequest(gpa, arena_allocator, body, upstream.models);
 
     return .{ .request = request.*, .url = upstream.url, .body = rewritten, .headers = headers, .client = client };
 }
@@ -33,7 +35,9 @@ pub fn prepare(gpa: std.mem.Allocator, allocator: std.mem.Allocator, request: *s
 /// closes only the client's sending direction; transport errors cancel the relay.
 /// Join both tasks before releasing their buffers or socket. The HTTP client
 /// is borrowed from the service and outlives every relay.
-pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: std.Io.net.Stream, pending: *Pending) !std.http.Status {
+/// arena_allocator must be arena-backed; copied response headers are left for
+/// caller-owned bulk reclamation after return, including on error.
+pub fn forward(client: *std.http.Client, arena_allocator: std.mem.Allocator, stream: std.Io.net.Stream, pending: *Pending) !std.http.Status {
     const io = client.io;
     const Completion = union(enum) { response: anyerror!std.http.Status, downstream: std.Io.net.Stream.Reader.Error!void };
 
@@ -42,7 +46,7 @@ pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: s
     defer select.cancelDiscard();
 
     try select.concurrent(.downstream, monitorDownstream, .{ io, stream });
-    try select.concurrent(.response, relay, .{ client, allocator, pending });
+    try select.concurrent(.response, relay, .{ client, arena_allocator, pending });
 
     while (true) switch (try select.await()) {
         .response => |result| return result,
@@ -159,33 +163,37 @@ fn transferResponse(outgoing: *std.http.Client.Request, allocator: std.mem.Alloc
     return status;
 }
 
-fn requestHeaders(allocator: std.mem.Allocator, request: *std.http.Server.Request, contract: Contract) ![]const std.http.Header {
+/// arena_allocator must be arena-backed; partial lists and header copies are
+/// left for caller-owned bulk reclamation on error.
+fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, contract: Contract) ![]const std.http.Header {
     var result: std.ArrayList(std.http.Header) = .empty;
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "authorization") or
             hopByHop(header.name, request.iterateHeaders()) or
             !contract.allowsRequestHeader(header.name)) continue;
-        try result.append(allocator, try copyHeader(allocator, header));
+        try result.append(arena_allocator, try copyHeader(arena_allocator, header));
     }
-    try result.appendSlice(allocator, contract.requiredHeaders());
-    return result.toOwnedSlice(allocator);
+    try result.appendSlice(arena_allocator, contract.requiredHeaders());
+    return result.toOwnedSlice(arena_allocator);
 }
 
-fn responseHeaders(allocator: std.mem.Allocator, head: std.http.Client.Response.Head) ![]const std.http.Header {
+/// arena_allocator has the same bulk-lifetime contract as requestHeaders.
+fn responseHeaders(arena_allocator: std.mem.Allocator, head: std.http.Client.Response.Head) ![]const std.http.Header {
     var result: std.ArrayList(std.http.Header) = .empty;
     var iterator = head.iterateHeaders();
     while (iterator.next()) |header| {
         if (hopByHop(header.name, head.iterateHeaders()) or
             std.ascii.eqlIgnoreCase(header.name, "content-length") or
             std.ascii.eqlIgnoreCase(header.name, "authorization")) continue;
-        try result.append(allocator, try copyHeader(allocator, header));
+        try result.append(arena_allocator, try copyHeader(arena_allocator, header));
     }
-    return result.toOwnedSlice(allocator);
+    return result.toOwnedSlice(arena_allocator);
 }
 
-fn copyHeader(allocator: std.mem.Allocator, header: std.http.Header) !std.http.Header {
-    return .{ .name = try allocator.dupe(u8, header.name), .value = try allocator.dupe(u8, header.value) };
+/// The caller reclaims both fields with the arena, including partial copies on error.
+fn copyHeader(arena_allocator: std.mem.Allocator, header: std.http.Header) !std.http.Header {
+    return .{ .name = try arena_allocator.dupe(u8, header.name), .value = try arena_allocator.dupe(u8, header.value) };
 }
 
 fn hopByHop(name: []const u8, iterator: std.http.HeaderIterator) bool {
