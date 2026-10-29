@@ -5,6 +5,9 @@ pub const Session = @import("codex/session.zig").Session;
 /// SIWC direct-token credentials are sent only to this approved endpoint.
 const siwc_responses_url = "https://api.openai.com/v1/responses";
 
+// Match std.json.Stringify's fixed nesting capacity, including the root object.
+const max_request_depth = 256;
+
 pub const Upstream = struct {
     url: []const u8,
     models: std.json.ArrayHashMap([]const u8),
@@ -92,6 +95,7 @@ pub const Contract = enum {
 
     /// Returns an allocator-owned body; parsed values do not escape.
     pub fn rewriteRequest(self: Contract, allocator: std.mem.Allocator, body: []const u8, models: std.json.ArrayHashMap([]const u8)) ![]u8 {
+        try validateRequestDepth(allocator, body);
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{ .parse_numbers = false }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidRequest,
@@ -120,6 +124,21 @@ pub const Contract = enum {
         return std.json.Stringify.valueAlloc(allocator, value, .{});
     }
 };
+
+// Scan tokens before building the value tree so excessive nesting never reaches
+// recursive serialization. The scanner handles quoted/escaped delimiters for us.
+fn validateRequestDepth(allocator: std.mem.Allocator, body: []const u8) !void {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, body);
+    defer scanner.deinit();
+    while (true) {
+        const token = scanner.next() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidRequest,
+        };
+        if (scanner.stackHeight() > max_request_depth) return error.InvalidRequest;
+        if (token == .end_of_document) return;
+    }
+}
 
 // Compatibility exclusions observed in CLIProxyAPI's SIWC body rules. Other
 // native fields are preserved; we do not adopt its translators or ID/cache edits.
@@ -163,6 +182,59 @@ test "provider model rewrite preserves native request fields" {
     for ([_][]const u8{ "invalid", "[]", "{}", "{\"model\":1}" }) |invalid| {
         try std.testing.expectError(error.InvalidRequest, Contract.responses.rewriteRequest(std.testing.allocator, invalid, models));
     }
+}
+
+test "provider request depth bounds arrays, objects, and mixed containers for both contracts" {
+    const a = std.testing.allocator;
+    var models: std.json.ArrayHashMap([]const u8) = .{};
+    defer models.deinit(a);
+    try models.map.put(a, "demo", "upstream-model");
+    for ([_]Contract{ .responses, .siwc }) |contract| {
+        for ([_]enum { arrays, objects, mixed }{ .arrays, .objects, .mixed }) |kind| {
+            for ([_]usize{ max_request_depth, max_request_depth + 1, 301 }) |depth| {
+                var input: std.Io.Writer.Allocating = .init(a);
+                defer input.deinit();
+                try input.writer.writeAll("{\"model\":\"demo\",\"stream\":true,\"input\":");
+                for (1..depth) |level| {
+                    try input.writer.writeAll(if (kind == .objects or (kind == .mixed and level % 2 == 0)) "{\"nested\":" else "[");
+                }
+                try input.writer.writeAll("null");
+                var level = depth;
+                while (level > 1) {
+                    level -= 1;
+                    try input.writer.writeAll(if (kind == .objects or (kind == .mixed and level % 2 == 0)) "}" else "]");
+                }
+                try input.writer.writeAll("}");
+                if (depth > max_request_depth) {
+                    try std.testing.expectError(error.InvalidRequest, contract.rewriteRequest(a, input.written(), models));
+                } else {
+                    const body = try contract.rewriteRequest(a, input.written(), models);
+                    defer a.free(body);
+                    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
+                }
+            }
+        }
+    }
+}
+
+test "provider request depth ignores string delimiters and counts nesting rather than siblings" {
+    const a = std.testing.allocator;
+    var models: std.json.ArrayHashMap([]const u8) = .{};
+    defer models.deinit(a);
+    try models.map.put(a, "demo", "upstream-model");
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.writeAll(
+        \\{"model":"demo","input":["escaped quote: \" backslash: \\ brackets:
+    );
+    try input.writer.splatByteAll('[', 300);
+    try input.writer.splatByteAll('}', 300);
+    try input.writer.writeAll("\"");
+    for (0..300) |_| try input.writer.writeAll(",[{},[]]");
+    try input.writer.writeAll("]}");
+    const body = try Contract.responses.rewriteRequest(a, input.written(), models);
+    defer a.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"upstream-model\"") != null);
 }
 
 test "provider SIWC requires streaming, disables storage, and rejects unsupported controls" {

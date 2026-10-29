@@ -292,6 +292,65 @@ const TransportTest = struct {
     }
 };
 
+test "transport rejects deeply nested JSON without forwarding and serves the next request" {
+    const T = TransportTest;
+    var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
+    defer upstream_client.deinit();
+    var fixture = try T.fixture.Fixture.init(T.allocator, T.io, &.{
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+    });
+    defer fixture.deinit();
+    try fixture.start();
+    const origin = try fixture.origin(T.allocator);
+    defer T.allocator.free(origin);
+    var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
+    defer upstream.models.deinit(T.allocator);
+    try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    var active: std.atomic.Value(usize) = .init(0);
+    var tasks: std.Io.Group = .init;
+    defer tasks.cancel(T.io);
+    var payload: std.Io.Writer.Allocating = .init(T.allocator);
+    defer payload.deinit();
+    try payload.writer.writeAll("{\"model\":\"demo\",\"input\":");
+    try payload.writer.splatByteAll('[', 300);
+    try payload.writer.writeAll("null");
+    try payload.writer.splatByteAll(']', 300);
+    try payload.writer.writeAll("}");
+
+    for ([_]bool{ false, true }, 0..) |chunked, count| {
+        const rejected = try T.connect(&upstream_client, &config, &active, &tasks);
+        defer rejected.close(T.io);
+        var buffer: [1024]u8 = undefined;
+        var writer = rejected.writer(T.io, &buffer);
+        try writer.interface.writeAll("POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\n");
+        if (chunked) {
+            try writer.interface.print("Transfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{ payload.written().len, payload.written() });
+        } else {
+            try writer.interface.print("Content-Length: {d}\r\n\r\n{s}", .{ payload.written().len, payload.written() });
+        }
+        try writer.interface.flush();
+        const rejection = try T.receive(rejected);
+        defer T.allocator.free(rejection);
+        try std.testing.expect(std.mem.startsWith(u8, rejection, "HTTP/1.1 400 Bad Request\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, rejection, "{\"error\":\"invalid_request\"}\n"));
+        try std.testing.expectEqual(count, fixture.count.load(.acquire));
+
+        const next = try T.connect(&upstream_client, &config, &active, &tasks);
+        defer next.close(T.io);
+        try T.send(next, chunked);
+        const raw = try T.receive(next);
+        defer T.allocator.free(raw);
+        try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, raw, "ok"));
+        try std.testing.expectEqual(count + 1, fixture.count.load(.acquire));
+    }
+    try tasks.await(T.io);
+    try std.testing.expectEqual(0, active.load(.monotonic));
+}
+
 test "transport socket relay preserves payload, isolates headers, and handles response framing without replay" {
     const T = TransportTest;
     var upstream_client: std.http.Client = .{ .allocator = T.allocator, .io = T.io };
