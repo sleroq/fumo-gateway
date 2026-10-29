@@ -97,15 +97,16 @@ fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, pending
         // FIXME: this is weird and should be fixes in std
         // Before receiveHead, even a partially sent request has reader state .ready.
         connection.closing = true;
-        const read_err = connection.stream_reader.err orelse err;
-        const write_err = connection.stream_writer.err orelse err;
         switch (err) {
             error.ReadFailed => {
-                if (outgoing.reader.body_err == null and (read_err == error.Canceled or write_err == error.Canceled))
+                // A non-null body_err identifies an HTTP framing failure, not
+                // a transport read failure; getReadError requires the latter.
+                if (outgoing.reader.body_err == null and (connection.getReadError() orelse err) == error.Canceled)
                     return error.Canceled;
             },
             error.WriteFailed => {
-                if (write_err == error.Canceled) return error.Canceled;
+                // std has no write-error accessor; TLS writes retain socket errors here too.
+                if ((connection.stream_writer.err orelse err) == error.Canceled) return error.Canceled;
             },
             else => {},
         }
