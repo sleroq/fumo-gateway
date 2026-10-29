@@ -19,7 +19,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !v
     var provider = if (config.upstream) |upstream| try Provider.init(allocator, io, upstream) else null;
     defer if (provider) |*value| value.deinit();
 
-    var listener = try config.address.listen(io, .{ .reuse_address = true });
+    var listener = try config.address.listen(io, .{});
     defer listener.deinit(io);
 
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
