@@ -1,5 +1,5 @@
 const std = @import("std");
-const Session = @import("server").Session;
+const Session = @import("provider").Session;
 const local = @import("fixture");
 const a = std.testing.allocator;
 const io = std.testing.io;
@@ -56,6 +56,25 @@ fn authorize(session: *Session, expected: []const u8) anyerror!void {
 fn configure(session: *Session, origin: []const u8) void {
     session.options.origin = origin;
     session.options.timeout = .{ .raw = .fromSeconds(2), .clock = .awake };
+}
+
+test "session provider owns credential loading and authorization snapshots" {
+    const Provider = @import("provider").Provider;
+    var storage = try Storage.init(3600);
+    defer storage.deinit();
+    var provider = try Provider.init(a, io, .{
+        .url = "https://api.openai.com/v1/responses",
+        .models = .{},
+        .auth = .{ .provider = .codex, .credentials_dir = storage.path },
+    });
+    defer provider.deinit();
+    const header = (try provider.authorization(a)).?;
+    defer a.free(header);
+    try std.testing.expectEqualStrings("Bearer old-access", header);
+    try std.testing.expect(!provider.session.?.refreshing);
+    var plain = try Provider.init(a, io, .{ .url = "http://localhost/v1/responses", .models = .{} });
+    defer plain.deinit();
+    try std.testing.expectEqual(null, try plain.authorization(a));
 }
 
 test "session fresh session stays idle" {

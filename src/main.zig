@@ -21,12 +21,7 @@ fn run(init: std.process.Init) !void {
         .serve => |path| {
             var config = try Config.load(init.gpa, init.io, path, init.environ_map);
             defer config.deinit();
-            var session: ?server.Session = null;
-            if (config.upstream) |upstream| {
-                if (upstream.auth) |options| session = try server.Session.init(init.gpa, init.io, options.credentials_dir.?);
-            }
-            defer if (session) |*value| value.deinit();
-            try server.serve(init.gpa, init.io, &config, if (session) |*value| value else null);
+            try server.serve(init.gpa, init.io, &config);
         },
         .login_codex => |directory| {
             const path = directory orelse try credentials.defaultDirectory(init.arena.allocator(), init.environ_map);

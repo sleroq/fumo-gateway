@@ -43,18 +43,18 @@ pub fn build(b: *std.Build) void {
     const auth_tests = b.addRunArtifact(b.addTest(.{ .root_module = codex }));
     b.step("test-auth", "Test SIWC auth against local fixtures").dependOn(&auth_tests.step);
 
-    const server = b.createModule(.{
-        .root_source_file = b.path("src/server.zig"),
+    const provider = b.createModule(.{
+        .root_source_file = b.path("src/provider.zig"),
         .target = target,
         .optimize = optimize,
     });
-    server.addImport("fixture", fixture);
+    provider.addImport("fixture", fixture);
     const service = b.createModule(.{
         .root_source_file = b.path("tests/service.zig"),
         .target = target,
         .optimize = optimize,
     });
-    service.addImport("server", server);
+    service.addImport("provider", provider);
     service.addImport("fixture", fixture);
     const service_tests = b.addRunArtifact(b.addTest(.{ .root_module = service, .filters = &.{"session "} }));
     b.step("test-service", "Test nonblocking SIWC refresh against local fixtures").dependOn(&service_tests.step);

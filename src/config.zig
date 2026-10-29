@@ -1,35 +1,6 @@
 const std = @import("std");
 const auth = @import("auth.zig");
-const credentials = @import("codex/credentials.zig");
-const provider = @import("provider.zig");
-
-pub const Upstream = struct {
-    url: []const u8,
-    models: std.json.ArrayHashMap([]const u8),
-    auth: ?struct {
-        provider: enum { codex },
-        credentials_dir: ?[]const u8 = null,
-    } = null,
-
-    fn validate(self: Upstream) !void {
-        const uri = std.Uri.parse(self.url) catch return error.InvalidUpstreamUrl;
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidUpstreamUrl;
-        const host = uri.host orelse return error.InvalidUpstreamUrl;
-        if (host.isEmpty() or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidUpstreamUrl;
-        if (uri.port == 0) return error.InvalidUpstreamUrl;
-        if (self.auth) |options| {
-            if (!std.mem.eql(u8, self.url, provider.siwc_responses_url)) return error.InvalidCodexEndpoint;
-            if (options.credentials_dir) |directory| {
-                if (std.mem.trim(u8, directory, " \t\r\n").len == 0) return error.InvalidDirectory;
-            }
-        }
-        if (self.models.map.count() == 0) return error.NoUpstreamModels;
-        for (self.models.map.keys(), self.models.map.values()) |alias, model| {
-            if (alias.len == 0) return error.EmptyModelAlias;
-            if (model.len == 0) return error.EmptyUpstreamModel;
-        }
-    }
-};
+pub const Upstream = @import("provider.zig").Upstream;
 
 const Document = struct {
     upstream: ?Upstream = null,
@@ -57,10 +28,7 @@ pub const Config = struct {
         const document = try std.json.parseFromSliceLeaky(Document, allocator, text, .{ .allocate = .alloc_always });
         var upstream = document.upstream;
         if (upstream) |*value| {
-            try value.validate();
-            if (value.auth) |*options| {
-                if (options.credentials_dir == null) options.credentials_dir = try credentials.defaultDirectory(allocator, environ);
-            }
+            try value.configure(allocator, environ);
         }
         const address = std.Io.net.IpAddress.parseLiteral(document.listen) catch return error.InvalidListenAddress;
         if (address.getPort() == 0) return error.InvalidListenAddress;

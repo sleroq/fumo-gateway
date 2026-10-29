@@ -1,11 +1,12 @@
 const std = @import("std");
-const Upstream = @import("config.zig").Upstream;
-const Provider = @import("provider.zig").Provider;
+const Upstream = @import("provider.zig").Upstream;
+const Contract = @import("provider.zig").Contract;
 
 pub const max_body_size = 16 * 1024 * 1024;
 
 pub const Pending = struct {
     request: std.http.Server.Request,
+    url: []const u8,
     body: []u8,
     headers: []const std.http.Header,
     client: []const u8,
@@ -13,37 +14,23 @@ pub const Pending = struct {
 };
 
 /// Capture headers before reading the body invalidates the HTTP head buffer.
-pub fn prepare(allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, provider: Provider, client: []const u8) !Pending {
-    const headers = try requestHeaders(allocator, request, provider);
+pub fn prepare(allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
+    const headers = try requestHeaders(allocator, request, upstream.contract());
     if (request.head.content_length) |length| {
         if (length > max_body_size) return error.StreamTooLong;
     }
 
     const reader = try request.readerExpectContinue(&.{});
     const body = try reader.allocRemaining(allocator, .limited(max_body_size));
-    const rewritten = try rewriteModel(allocator, body, upstream);
+    const rewritten = try upstream.contract().rewriteRequest(allocator, body, upstream.models);
 
-    return .{ .request = request.*, .body = rewritten, .headers = headers, .client = client };
-}
-
-fn rewriteModel(allocator: std.mem.Allocator, body: []const u8, upstream: Upstream) ![]u8 {
-    var value = std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{ .parse_numbers = false }) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return error.InvalidRequest,
-    };
-
-    if (value != .object) return error.InvalidRequest;
-    const model = value.object.getPtr("model") orelse return error.InvalidRequest;
-    if (model.* != .string) return error.InvalidRequest;
-    const mapped = upstream.models.map.get(model.string) orelse return error.UnknownModel;
-    model.* = .{ .string = mapped };
-    return std.json.Stringify.valueAlloc(allocator, value, .{});
+    return .{ .request = request.*, .url = upstream.url, .body = rewritten, .headers = headers, .client = client };
 }
 
 /// Once the request body is consumed, only the monitor reads downstream. Cancel
 /// and join the relay before releasing its buffers or socket. The HTTP client
 /// is borrowed from the service and outlives every relay.
-pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: std.Io.net.Stream, upstream: Upstream, pending: *Pending) !std.http.Status {
+pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: std.Io.net.Stream, pending: *Pending) !std.http.Status {
     const io = client.io;
     const Completion = union(enum) { response: anyerror!std.http.Status, disconnected: void };
 
@@ -52,7 +39,7 @@ pub fn forward(client: *std.http.Client, allocator: std.mem.Allocator, stream: s
     defer select.cancelDiscard();
 
     try select.concurrent(.disconnected, waitForDisconnect, .{ io, stream });
-    try select.concurrent(.response, relay, .{ client, allocator, upstream, pending });
+    try select.concurrent(.response, relay, .{ client, allocator, pending });
 
     return switch (try select.await()) {
         .response => |result| try result,
@@ -69,9 +56,9 @@ fn waitForDisconnect(io: std.Io, stream: std.Io.net.Stream) void {
     }
 }
 
-fn relay(client: *std.http.Client, allocator: std.mem.Allocator, upstream: Upstream, pending: *Pending) !std.http.Status {
+fn relay(client: *std.http.Client, allocator: std.mem.Allocator, pending: *Pending) !std.http.Status {
     var started = false;
-    return relayResponse(client, allocator, upstream, pending, &started) catch |err| {
+    return relayResponse(client, allocator, pending, &started) catch |err| {
         // Reader/Writer interfaces wrap cancellation in ReadFailed/WriteFailed.
         try client.io.checkCancel();
         std.log.warn("event=upstream_failed error={s}", .{@errorName(err)});
@@ -85,8 +72,8 @@ fn relay(client: *std.http.Client, allocator: std.mem.Allocator, upstream: Upstr
     };
 }
 
-fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, upstream: Upstream, pending: *Pending, started: *bool) !std.http.Status {
-    var outgoing = try client.request(.POST, try std.Uri.parse(upstream.url), .{
+fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, pending: *Pending, started: *bool) !std.http.Status {
+    var outgoing = try client.request(.POST, try std.Uri.parse(pending.url), .{
         .keep_alive = false,
         .redirect_behavior = .unhandled,
         .headers = .{
@@ -150,15 +137,16 @@ fn relayResponse(client: *std.http.Client, allocator: std.mem.Allocator, upstrea
     return status;
 }
 
-fn requestHeaders(allocator: std.mem.Allocator, request: *std.http.Server.Request, provider: Provider) ![]const std.http.Header {
+fn requestHeaders(allocator: std.mem.Allocator, request: *std.http.Server.Request, contract: Contract) ![]const std.http.Header {
     var result: std.ArrayList(std.http.Header) = .empty;
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "authorization") or
             hopByHop(header.name, request.iterateHeaders()) or
-            !provider.allowsRequestHeader(header.name)) continue;
+            !contract.allowsRequestHeader(header.name)) continue;
         try result.append(allocator, try copyHeader(allocator, header));
     }
+    try result.appendSlice(allocator, contract.requiredHeaders());
     return result.toOwnedSlice(allocator);
 }
 
@@ -194,26 +182,6 @@ fn hopByHop(name: []const u8, iterator: std.http.HeaderIterator) bool {
     return false;
 }
 
-test "model rewrite preserves native request fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var upstream: Upstream = .{ .url = "http://localhost/v1/responses", .models = .{} };
-    try upstream.models.map.put(allocator, "demo", "upstream-model");
-    const body = try rewriteModel(allocator,
-        \\{"model":"demo","input":[{"type":"function_call_output","call_id":"123","output":"ok"}],"stream":true,"reasoning":{"effort":"high"},"previous_response_id":"resp_1","metadata":{"precise":18446744073709551617}}
-    , upstream);
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{});
-    try std.testing.expectEqualStrings("upstream-model", value.object.get("model").?.string);
-    try std.testing.expectEqualStrings("function_call_output", value.object.get("input").?.array.items[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("resp_1", value.object.get("previous_response_id").?.string);
-    try std.testing.expect(std.mem.find(u8, body, "18446744073709551617") != null);
-    try std.testing.expectError(error.UnknownModel, rewriteModel(allocator, "{\"model\":\"unknown\"}", upstream));
-    for ([_][]const u8{ "invalid", "[]", "{}", "{\"model\":1}" }) |invalid| {
-        try std.testing.expectError(error.InvalidRequest, rewriteModel(allocator, invalid, upstream));
-    }
-}
-
 test "transport applies the supplied provider contract without forwarding gateway auth or hop headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -221,13 +189,79 @@ test "transport applies the supplied provider contract without forwarding gatewa
     var writer: std.Io.Writer.Discarding = .init(&.{});
     var http = std.http.Server.init(&reader, &writer.writer);
     var request = try http.receiveHead();
-    // Deliberately allow auth and a connection-nominated header to verify that
-    // provider policy cannot override the transport's exclusions.
-    const provider: Provider = .{ .request_headers = &.{ "session_id", "openai-beta", "authorization", "connection" } };
-    const headers = try requestHeaders(arena.allocator(), &request, provider);
+    const headers = try requestHeaders(arena.allocator(), &request, .responses);
     try std.testing.expectEqual(1, headers.len);
     try std.testing.expectEqualStrings("Session_id", headers[0].name);
     try std.testing.expectEqualStrings("session", headers[0].value);
-    const no_headers: Provider = .{ .request_headers = &.{} };
-    try std.testing.expectEqual(0, (try requestHeaders(arena.allocator(), &request, no_headers)).len);
+}
+
+test "transport SIWC fixture enforces provider body and headers while preserving native fields" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const native =
+        \\,"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"reasoning":{"effort":"high"},"previous_response_id":"resp_1","prompt_cache_key":"cache_1","instructions":"","metadata":{"precise":18446744073709551617}}
+    ;
+    const payload = "{\"model\":\"demo\",\"stream\":true" ++ native;
+    const sse = "data: {\"type\":\"response.completed\"}\n\n";
+    var fixture = try @import("fixture").Fixture.init(a, io, &.{.{
+        .bytes = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" ++ sse,
+    }});
+    defer fixture.deinit();
+    try fixture.start();
+    const origin = try fixture.origin(a);
+    defer a.free(origin);
+    const url = try std.fmt.allocPrint(a, "{s}/v1/responses", .{origin});
+    defer a.free(url);
+    // Exercise the contract against loopback, without adding a production
+    // endpoint override. Provider.init separately proves pinning is mandatory.
+    var upstream: Upstream = .{ .url = url, .models = .{}, .auth = .{ .provider = .codex } };
+    defer upstream.models.deinit(a);
+    try upstream.models.map.put(a, "demo", "fixture-model");
+    const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer gateway-secret\r\nCookie: private\r\nProxy-Authorization: private\r\nX-Api-Key: private\r\nAccept: application/json\r\nAccept: */*\r\nUser-Agent: private\r\nSession_id: session_1\r\nX-Request-Id: private\r\nConnection: x-request-id, accept\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
+    defer a.free(raw);
+    var reader = std.Io.Reader.fixed(raw);
+    var writer: std.Io.Writer.Allocating = .init(a);
+    defer writer.deinit();
+    var http = std.http.Server.init(&reader, &writer.writer);
+    var request = try http.receiveHead();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var pending = try prepare(arena.allocator(), &request, upstream, "fixture");
+    pending.authorization = "Bearer fixture-access";
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    var started = false;
+    try std.testing.expectEqual(.ok, try relayResponse(&client, arena.allocator(), &pending, &started));
+    try fixture.waitRequest();
+    const captured = fixture.requests[0].?;
+    try std.testing.expect(std.mem.startsWith(u8, captured, "POST /v1/responses HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.find(u8, captured, "gateway-secret") == null);
+    try std.testing.expect(std.mem.find(u8, captured, "private") == null);
+    const body_start = std.mem.find(u8, captured, "\r\n\r\n").? + 4;
+    try std.testing.expectEqualStrings("{\"model\":\"fixture-model\",\"stream\":true" ++ native[0 .. native.len - 1] ++ ",\"store\":false}", captured[body_start..]);
+    var captured_reader = std.Io.Reader.fixed(captured);
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var upstream_http = std.http.Server.init(&captured_reader, &discard.writer);
+    const received = try upstream_http.receiveHead();
+    const expected = [_]std.http.Header{
+        .{ .name = "authorization", .value = "Bearer fixture-access" },
+        .{ .name = "accept", .value = "text/event-stream" },
+        .{ .name = "user-agent", .value = "fumo-gateway" },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "accept-encoding", .value = "identity" },
+        .{ .name = "session_id", .value = "session_1" },
+    };
+    for (expected) |header| {
+        var count: usize = 0;
+        var headers = received.iterateHeaders();
+        while (headers.next()) |actual| {
+            if (!std.ascii.eqlIgnoreCase(actual.name, header.name)) continue;
+            count += 1;
+            try std.testing.expectEqualStrings(header.value, actual.value);
+        }
+        try std.testing.expectEqual(1, count);
+    }
+    try std.testing.expect(std.ascii.findIgnoreCase(writer.written(), "content-type: text/event-stream") != null);
+    try std.testing.expect(std.mem.find(u8, writer.written(), sse) != null);
+    try std.testing.expectEqual(1, fixture.count.load(.acquire));
 }

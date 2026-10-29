@@ -1,9 +1,8 @@
 const std = @import("std");
 const auth = @import("auth.zig");
 pub const Config = @import("config.zig").Config;
-pub const Session = @import("codex/session.zig").Session;
 const responses = @import("responses.zig");
-const provider = @import("provider.zig");
+const Provider = @import("provider.zig").Provider;
 
 const Route = enum { health, responses, unknown };
 const routes = std.StaticStringMap(Route).initComptime(.{
@@ -15,8 +14,11 @@ const max_connections = 64;
 const request_timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(5), .clock = .awake };
 
 /// allocator must be thread-safe. The HTTP client is service-owned; all
-/// connections finish before it or the caller-owned session is deinitialized.
-pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config, session: ?*Session) !void {
+/// connections finish before it or the provider is deinitialized.
+pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !void {
+    var provider = if (config.upstream) |upstream| try Provider.init(allocator, io, upstream) else null;
+    defer if (provider) |*value| value.deinit();
+
     var listener = try config.address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
@@ -37,7 +39,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config, se
             continue;
         }
         const deadline = std.Io.Clock.Timestamp.fromNow(io, request_timeout);
-        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, session, &active, deadline }) catch |err| {
+        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, if (provider) |*value| value else null, &active, deadline }) catch |err| {
             stream.close(io);
             _ = active.fetchSub(1, .monotonic);
             std.log.warn("event=connection_dispatch_failed error={s}", .{@errorName(err)});
@@ -50,7 +52,7 @@ fn handleConnection(
     client: *std.http.Client,
     stream: std.Io.net.Stream,
     config: *const Config,
-    session: ?*Session,
+    provider: ?*Provider,
     active: *std.atomic.Value(usize),
     deadline: std.Io.Clock.Timestamp,
 ) void {
@@ -70,8 +72,8 @@ fn handleConnection(
         std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
         return;
     }) orelse return;
-    if (session) |credentials| {
-        pending.authorization = credentials.authorization(arena.allocator()) catch |err| {
+    if (provider) |upstream| {
+        pending.authorization = upstream.authorization(arena.allocator()) catch |err| {
             std.log.warn("event=upstream_credentials_unavailable error={s}", .{@errorName(err)});
             pending.request.respond("{\"error\":\"upstream_credentials_unavailable\"}\n", .{
                 .status = .service_unavailable,
@@ -82,7 +84,7 @@ fn handleConnection(
             return;
         };
     }
-    const status = responses.forward(client, arena.allocator(), stream, config.upstream.?, &pending) catch |err| {
+    const status = responses.forward(client, arena.allocator(), stream, &pending) catch |err| {
         std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
         return;
     };
@@ -128,7 +130,7 @@ fn prepareRequest(io: std.Io, allocator: std.mem.Allocator, http: *std.http.Serv
         },
         .responses => if (client != null and request.head.method == .POST) {
             if (config.upstream) |upstream| {
-                if (responses.prepare(allocator, &request, upstream, provider.responses, client.?)) |pending| {
+                if (responses.prepare(allocator, &request, upstream, client.?)) |pending| {
                     return pending;
                 } else |err| switch (err) {
                     error.InvalidRequest => {
@@ -232,6 +234,10 @@ const TransportTest = struct {
     const first = "data: {\"delta\":\"first\"}\n\n";
 
     fn connect(upstream_client: *std.http.Client, config: *const Config, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
+        return connectWithProvider(upstream_client, config, null, active, tasks);
+    }
+
+    fn connectWithProvider(upstream_client: *std.http.Client, config: *const Config, provider: ?*Provider, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
         var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
         defer listener.deinit(io);
         const client = try listener.socket.address.connect(io, .{ .mode = .stream });
@@ -239,7 +245,7 @@ const TransportTest = struct {
         const accepted = try listener.accept(io);
         errdefer accepted.close(io);
         _ = active.fetchAdd(1, .monotonic);
-        try tasks.concurrent(io, handleConnection, .{ allocator, upstream_client, accepted, config, null, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout) });
+        try tasks.concurrent(io, handleConnection, .{ allocator, upstream_client, accepted, config, provider, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout) });
         return client;
     }
 
@@ -470,6 +476,93 @@ test "transport shared client isolates concurrent cancellation and remains usabl
     try std.testing.expectEqual(0, active.load(.monotonic));
     try std.testing.expect(upstream_client.connection_pool.used.first == null);
     try std.testing.expectEqual(0, upstream_client.connection_pool.free_len);
+}
+
+test "transport unavailable SIWC credentials return 503 without sending inference" {
+    const T = TransportTest;
+    const a = T.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(T.io, .fromMode(0o700));
+    const directory = try tmp.dir.realPathFileAlloc(T.io, ".", a);
+    defer a.free(directory);
+    {
+        const file = try tmp.dir.createFile(T.io, "codex.json", .{ .permissions = .fromMode(0o600) });
+        defer file.close(T.io);
+        try file.writeStreamingAll(T.io,
+            \\{"access_token":"expired-access","refresh_token":"refresh","id_token":"id","client_id":"client","device_id":"device","scope":"chatgpt.tokens.use.direct","obtained_at":1,"expires_at":2}
+        );
+    }
+    var upstream: @import("provider.zig").Upstream = .{
+        .url = "https://api.openai.com/v1/responses",
+        .models = .{},
+        .auth = .{ .provider = .codex, .credentials_dir = directory },
+    };
+    defer upstream.models.deinit(a);
+    try upstream.models.map.put(a, "demo", "fixture-model");
+    var provider = try Provider.init(a, T.io, upstream);
+    defer provider.deinit();
+    // A terminal refresh failure with an expired token must fail closed. No
+    // refresh worker or external network is needed to exercise this state.
+    provider.session.?.reauthentication_required = true;
+    var fixture = try T.fixture.Fixture.init(a, T.io, &.{.{ .bytes = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n" }});
+    defer fixture.deinit();
+    try fixture.start();
+    const origin = try fixture.origin(a);
+    defer a.free(origin);
+    // Any accidentally forwarded inference can only reach this local fixture.
+    upstream.url = origin;
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    var upstream_client: std.http.Client = .{ .allocator = a, .io = T.io };
+    defer upstream_client.deinit();
+    var active: std.atomic.Value(usize) = .init(0);
+    var tasks: std.Io.Group = .init;
+    defer tasks.cancel(T.io);
+    const client = try T.connectWithProvider(&upstream_client, &config, &provider, &active, &tasks);
+    defer client.close(T.io);
+    try T.send(client, false);
+    const raw = try T.receive(client);
+    defer a.free(raw);
+    try tasks.await(T.io);
+    try std.testing.expect(std.mem.find(u8, raw, "503 Service Unavailable") != null);
+    try std.testing.expect(std.mem.find(u8, raw, "upstream_credentials_unavailable") != null);
+    try std.testing.expectEqual(0, fixture.count.load(.acquire));
+    try std.testing.expect(!provider.session.?.refreshing);
+}
+
+test "transport SIWC invalid contracts fail locally after gateway authentication" {
+    const a = std.testing.allocator;
+    var upstream: @import("provider.zig").Upstream = .{
+        .url = "https://api.openai.com/v1/responses",
+        .models = .{},
+        .auth = .{ .provider = .codex },
+    };
+    defer upstream.models.deinit(a);
+    try upstream.models.map.put(a, "demo", "upstream-model");
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    const cases = .{
+        .{ "wrong-key", "{\"model\":\"demo\",\"stream\":true}", "401 Unauthorized", "unauthorized" },
+        .{ "transport-secret", "{\"model\":\"demo\"}", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "{\"model\":\"demo\",\"stream\":false}", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "{\"model\":\"demo\",\"stream\":true,\"store\":true}", "400 Bad Request", "invalid_request" },
+        .{ "transport-secret", "{\"model\":\"demo\",\"stream\":true,\"max_output_tokens\":99}", "400 Bad Request", "invalid_request" },
+    };
+    inline for (cases) |case| {
+        const raw = try std.fmt.allocPrint(a, "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ case[0], case[1].len, case[1] });
+        defer a.free(raw);
+        var reader = std.Io.Reader.fixed(raw);
+        var writer: std.Io.Writer.Allocating = .init(a);
+        defer writer.deinit();
+        var http = std.http.Server.init(&reader, &writer.writer);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var completed: std.Io.Semaphore = .{};
+        try std.testing.expectEqual(null, try prepareRequest(std.testing.io, arena.allocator(), &http, &config, &completed));
+        try std.testing.expect(std.mem.find(u8, writer.written(), case[2]) != null);
+        try std.testing.expect(std.mem.find(u8, writer.written(), case[3]) != null);
+    }
 }
 
 test "transport oversized request is rejected before reading or inviting body" {
