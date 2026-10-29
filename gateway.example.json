@@ -1,10 +1,20 @@
 {
     "listen": "127.0.0.1:8080",
-    "upstream": {
-        "url": "https://api.openai.com/v1/responses",
-        "models": { "codex/gpt-6.1-sol": "gpt-6.1-sol" },
-        "auth": {
-            "provider": "codex"
+    "upstreams": {
+        "codex": {
+            "base_url": "https://api.openai.com/v1",
+            "protocol": "responses",
+            "auth": { "provider": "codex" }
+        },
+        "go": {
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "protocol": "chat_completions",
+            "auth": { "provider": "api_key", "key_env": "OPENCODE_GO_KEY" }
+        },
+        "zen": {
+            "base_url": "https://opencode.ai/zen/v1",
+            "protocol": "chat_completions",
+            "auth": { "provider": "api_key", "key_env": "OPENCODE_ZEN_KEY" }
         }
     },
     "clients": {

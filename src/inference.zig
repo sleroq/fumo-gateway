@@ -11,14 +11,15 @@ pub const Pending = struct {
     headers: []const std.http.Header,
     client: []const u8,
     authorization: ?[]const u8 = null,
+    upstream: usize = 0,
 };
 
 /// gpa must reclaim scratch on free; input/parsing scratch is released before return.
 /// arena_allocator must be arena-backed. The caller reclaims pending body/header
 /// allocations after forwarding, or partial allocations on any preparation error.
 /// Capture headers before reading the body invalidates the HTTP head buffer.
-pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream, client: []const u8) !Pending {
-    const headers = try requestHeaders(arena_allocator, request, upstream);
+pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, upstreams: []const Upstream, protocol: provider.Protocol, client: []const u8) !Pending {
+    const headers = try requestHeaders(arena_allocator, request);
     if (request.head.content_length) |length| {
         if (length > max_body_size) return error.StreamTooLong;
     }
@@ -26,9 +27,16 @@ pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, reque
     const reader = try request.readerExpectContinue(&.{});
     const body = try reader.allocRemaining(gpa, .limited(max_body_size));
     defer gpa.free(body);
-    const rewritten = try provider.rewriteRequest(gpa, arena_allocator, body, upstream.models);
-
-    return .{ .request = request.*, .url = upstream.url, .body = rewritten, .headers = headers, .client = client };
+    const routed = try provider.rewriteRequest(gpa, arena_allocator, body, upstreams, protocol);
+    const upstream = upstreams[routed.upstream];
+    return .{
+        .request = request.*,
+        .url = try arena_allocator.print("{s}{s}", .{ upstream.base_url, protocol.path() }),
+        .body = routed.body,
+        .headers = try std.mem.concat(arena_allocator, std.http.Header, &.{ headers, upstream.requiredHeaders() }),
+        .client = client,
+        .upstream = routed.upstream,
+    };
 }
 
 /// Once the request body is consumed, only the monitor reads downstream. EOF
@@ -174,7 +182,7 @@ fn transferResponse(outgoing: *std.http.Client.Request, allocator: std.mem.Alloc
 
 /// arena_allocator must be arena-backed; partial lists and header copies are
 /// left for caller-owned bulk reclamation on error.
-fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.Request, upstream: Upstream) ![]const std.http.Header {
+fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.Request) ![]const std.http.Header {
     var result: std.ArrayList(std.http.Header) = .empty;
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
@@ -183,7 +191,6 @@ fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.
             !provider.allowsRequestHeader(header.name)) continue;
         try result.append(arena_allocator, try copyHeader(arena_allocator, header));
     }
-    try result.appendSlice(arena_allocator, upstream.requiredHeaders());
     return result.toOwnedSlice(arena_allocator);
 }
 
@@ -349,16 +356,16 @@ test "transport malformed or truncated chunk framing remains a non-cancellation 
 test "transport preparation releases scratch before pending data is used" {
     const a = std.testing.allocator;
     var upstream: Upstream = .{
-        .url = "https://api.openai.com/v1/responses",
-        .models = .{},
-        .auth = .{ .provider = .codex },
+        .name = "test",
+        .base_url = "https://api.openai.com/v1",
+        .auth = .{ .codex = "/unused" },
     };
-    defer upstream.models.deinit(a);
-    try upstream.models.map.put(a, "demo", "upstream-model");
+    defer upstream.aliases.deinit(a);
+    try upstream.aliases.map.put(a, "demo", "upstream-model");
     const cases = [_]struct { body: []const u8, err: ?anyerror = null }{
-        .{ .body = "{\"model\":\"demo\",\"stream\":true,\"input\":[0,1,2]}" },
+        .{ .body = "{\"model\":\"test/demo\",\"stream\":true,\"input\":[0,1,2]}" },
         .{ .body = "{\"model\":", .err = error.InvalidRequest },
-        .{ .body = "{\"model\":\"unknown\",\"stream\":true}", .err = error.UnknownModel },
+        .{ .body = "{\"model\":\"unknown\",\"stream\":true}", .err = error.UnknownUpstream },
     };
     for (cases) |case| {
         const raw = try a.print("POST /v1/responses HTTP/1.1\r\nSession_id: session\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.body.len, case.body });
@@ -370,7 +377,7 @@ test "transport preparation releases scratch before pending data is used" {
         var retained = std.heap.ArenaAllocator.init(a);
         defer retained.deinit();
         var scratch = std.testing.FailingAllocator.init(a, .{});
-        const result = prepare(scratch.allocator(), retained.allocator(), &request, upstream, "fixture");
+        const result = prepare(scratch.allocator(), retained.allocator(), &request, &.{upstream}, .responses, "fixture");
         if (case.err) |err| {
             try std.testing.expectError(err, result);
         } else {
@@ -390,7 +397,7 @@ test "transport filters gateway auth and hop headers" {
     var writer: std.Io.Writer.Discarding = .init(&.{});
     var http = std.http.Server.init(&reader, &writer.writer);
     var request = try http.receiveHead();
-    const headers = try requestHeaders(arena.allocator(), &request, .{ .url = "http://localhost/v1/responses", .models = .{} });
+    const headers = try requestHeaders(arena.allocator(), &request);
     try std.testing.expectEqual(1, headers.len);
     try std.testing.expectEqualStrings("Session_id", headers[0].name);
     try std.testing.expectEqualStrings("session", headers[0].value);
@@ -402,7 +409,7 @@ test "transport SIWC fixture preserves native fields, client Accept, and stream 
     const native =
         \\,"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"reasoning":{"effort":"high"},"previous_response_id":"resp_1","prompt_cache_key":"cache_1","instructions":"","metadata":{"precise":18446744073709551617}}
     ;
-    const payload = "{\"model\":\"demo\",\"stream\":true" ++ native;
+    const payload = "{\"model\":\"test/demo\",\"stream\":true" ++ native;
     const sse = "data: {\"type\":\"response.completed\"}\n\n";
     var fixture = try @import("fixture").Fixture.init(a, io, &.{.{
         .bytes = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" ++ sse,
@@ -411,13 +418,13 @@ test "transport SIWC fixture preserves native fields, client Accept, and stream 
     try fixture.start();
     const origin = try fixture.origin(a);
     defer a.free(origin);
-    const url = try a.print("{s}/v1/responses", .{origin});
+    const url = try a.print("{s}/v1", .{origin});
     defer a.free(url);
     // Exercise preparation against loopback, without adding a production
     // endpoint override. Provider.init separately proves pinning is mandatory.
-    var upstream: Upstream = .{ .url = url, .models = .{}, .auth = .{ .provider = .codex } };
-    defer upstream.models.deinit(a);
-    try upstream.models.map.put(a, "demo", "fixture-model");
+    var upstream: Upstream = .{ .name = "test", .base_url = url, .auth = .{ .codex = "/unused" } };
+    defer upstream.aliases.deinit(a);
+    try upstream.aliases.map.put(a, "demo", "fixture-model");
     const raw = try a.print("POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer gateway-secret\r\nCookie: private\r\nProxy-Authorization: private\r\nX-Api-Key: private\r\nAccept: application/json\r\nUser-Agent: private\r\nSession_id: session_1\r\nX-Request-Id: private\r\nConnection: x-request-id\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
     defer a.free(raw);
     var reader = std.Io.Reader.fixed(raw);
@@ -427,7 +434,7 @@ test "transport SIWC fixture preserves native fields, client Accept, and stream 
     var request = try http.receiveHead();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var pending = try prepare(a, arena.allocator(), &request, upstream, "fixture");
+    var pending = try prepare(a, arena.allocator(), &request, &.{upstream}, .responses, "fixture");
     pending.authorization = "Bearer fixture-access";
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();

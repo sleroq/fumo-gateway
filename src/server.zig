@@ -1,23 +1,27 @@
 const std = @import("std");
 const auth = @import("auth.zig");
 pub const Config = @import("config.zig").Config;
-const responses = @import("responses.zig");
-const Provider = @import("provider.zig").Provider;
+const inference = @import("inference.zig");
+const Registry = @import("provider.zig").Registry;
+const Protocol = @import("provider.zig").Protocol;
 
-const Route = enum { health, responses, unknown };
+const Route = enum { health, models, responses, chat_completions, unknown };
 const routes = std.StaticStringMap(Route).initComptime(.{
     .{ "/healthz", .health },
+    .{ "/v1/models", .models },
     .{ "/v1/responses", .responses },
+    .{ "/v1/chat/completions", .chat_completions },
 });
 
 const max_connections = 64;
 const request_timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(5), .clock = .awake };
 
-/// allocator must be thread-safe. The HTTP client is service-owned; all
-/// connections finish before it or the provider is deinitialized.
+/// The caller owns Config. Provider storage never moves after requests begin.
+/// Shutdown joins requests first, then HTTP connections, then credential workers
+/// and model caches; only afterward may the caller release configuration.
 pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !void {
-    var provider = if (config.upstream) |upstream| try Provider.init(allocator, io, upstream) else null;
-    defer if (provider) |*value| value.deinit();
+    var providers = try Registry.init(allocator, io, config.upstreams);
+    defer providers.deinit();
 
     var listener = try config.address.listen(io, .{});
     defer listener.deinit(io);
@@ -39,7 +43,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !v
             continue;
         }
         const deadline = std.Io.Clock.Timestamp.fromNow(io, request_timeout);
-        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, if (provider) |*value| value else null, &active, deadline }) catch |err| {
+        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, &providers, &active, deadline }) catch |err| {
             stream.close(io);
             _ = active.fetchSub(1, .monotonic);
             std.log.warn("event=connection_dispatch_failed error={s}", .{@errorName(err)});
@@ -47,12 +51,17 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !v
     }
 }
 
+const Action = union(enum) {
+    inference: inference.Pending,
+    models: struct { request: std.http.Server.Request, client: []const u8 },
+};
+
 fn handleConnection(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     stream: std.Io.net.Stream,
     config: *const Config,
-    provider: ?*Provider,
+    providers: *Registry,
     active: *std.atomic.Value(usize),
     deadline: std.Io.Clock.Timestamp,
 ) void {
@@ -68,27 +77,35 @@ fn handleConnection(
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var pending = (prepareRequestWithDeadline(io, allocator, arena.allocator(), &http, config, deadline) catch |err| {
+
+    var action = (prepareRequestWithDeadline(io, allocator, arena.allocator(), &http, config, deadline) catch |err| {
         std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
         return;
     }) orelse return;
-    if (provider) |upstream| {
-        pending.authorization = upstream.authorization(arena.allocator()) catch |err| {
-            std.log.warn("event=upstream_credentials_unavailable error={s}", .{@errorName(err)});
-            pending.request.respond("{\"error\":\"upstream_credentials_unavailable\"}\n", .{
-                .status = .service_unavailable,
-                .keep_alive = false,
-                .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-            }) catch return;
-            logRequest(.service_unavailable, pending.client);
-            return;
-        };
+
+    switch (action) {
+        .models => |*pending| {
+            const body = providers.modelList(client, arena.allocator()) catch |err| {
+                if (err == error.Canceled) return;
+                std.log.warn("event=model_list_failed error={s}", .{@errorName(err)});
+                respond(&pending.request, .bad_gateway, "{\"error\":\"model_discovery_unavailable\"}\n", pending.client) catch {};
+                return;
+            };
+            respond(&pending.request, .ok, body, pending.client) catch {};
+        },
+        .inference => |*pending| {
+            pending.authorization = providers.entries[pending.upstream].authorization(arena.allocator()) catch |err| {
+                std.log.warn("event=upstream_credentials_unavailable error={s}", .{@errorName(err)});
+                respond(&pending.request, .service_unavailable, "{\"error\":\"upstream_credentials_unavailable\"}\n", pending.client) catch {};
+                return;
+            };
+            const status = inference.forward(client, arena.allocator(), stream, pending) catch |err| {
+                std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
+                return;
+            };
+            logRequest(status, pending.client);
+        },
     }
-    const status = responses.forward(client, arena.allocator(), stream, &pending) catch |err| {
-        std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
-        return;
-    };
-    logRequest(status, pending.client);
 }
 
 fn prepareRequestWithDeadline(
@@ -98,80 +115,73 @@ fn prepareRequestWithDeadline(
     http: *std.http.Server,
     config: *const Config,
     deadline: std.Io.Clock.Timestamp,
-) !?responses.Pending {
+) !?Action {
     var completed: std.Io.Semaphore = .{};
     var task = try io.concurrent(prepareRequest, .{ io, gpa, allocator, http, config, &completed });
-    // Only request reception is timed; long-lived SSE is not cut off.
+    // Only request reception is timed; discovery has its own bounded exchange
+    // and long-lived inference streams are not cut off.
     defer _ = task.cancel(io) catch null;
     try completed.waitTimeout(io, .{ .deadline = deadline });
     return try task.await(io);
 }
 
-fn prepareRequest(io: std.Io, gpa: std.mem.Allocator, allocator: std.mem.Allocator, http: *std.http.Server, config: *const Config, completed: *std.Io.Semaphore) !?responses.Pending {
+fn prepareRequest(io: std.Io, gpa: std.mem.Allocator, allocator: std.mem.Allocator, http: *std.http.Server, config: *const Config, completed: *std.Io.Semaphore) !?Action {
     defer completed.post(io);
 
     var request = try http.receiveHead();
     const path = request.head.target[0 .. std.mem.findScalar(u8, request.head.target, '?') orelse request.head.target.len];
-    var status: std.http.Status = .not_found;
-    var body: []const u8 = "{\"error\":\"not_found\"}\n";
-    var client: ?[]const u8 = null;
-
-    if (std.mem.startsWith(u8, path, "/v1/") or std.mem.eql(u8, path, "/v1")) {
-        client = auth.authenticate(config.clients, authorizationHeader(&request));
-        if (client == null) {
-            status = .unauthorized;
-            body = "{\"error\":\"unauthorized\"}\n";
-        }
+    const client = if (std.mem.startsWith(u8, path, "/v1/") or std.mem.eql(u8, path, "/v1"))
+        auth.authenticate(config.clients, authorizationHeader(&request))
+    else
+        null;
+    if ((std.mem.startsWith(u8, path, "/v1/") or std.mem.eql(u8, path, "/v1")) and client == null) {
+        try respond(&request, .unauthorized, "{\"error\":\"unauthorized\"}\n", null);
+        return null;
     }
 
     switch (routes.get(path) orelse .unknown) {
         .health => if (request.head.method == .GET) {
-            status = .ok;
-            body = "{\"status\":\"ok\"}\n";
+            try respond(&request, .ok, "{\"status\":\"ok\"}\n", null);
+            return null;
         },
-        .responses => if (client != null and request.head.method == .POST) {
-            if (config.upstream) |upstream| {
-                if (responses.prepare(gpa, allocator, &request, upstream, client.?)) |pending| {
-                    return pending;
-                } else |err| switch (err) {
-                    error.InvalidRequest => {
-                        status = .bad_request;
-                        body = "{\"error\":\"invalid_request\"}\n";
-                    },
-                    error.UnknownModel => {
-                        status = .bad_request;
-                        body = "{\"error\":\"unknown_model\"}\n";
-                    },
-                    error.StreamTooLong => {
-                        status = .payload_too_large;
-                        body = "{\"error\":\"request_too_large\"}\n";
-                    },
-                    error.HttpExpectationFailed => {
-                        status = .expectation_failed;
-                        body = "{\"error\":\"unsupported_expectation\"}\n";
-                    },
+        .models => if (request.head.method == .GET) {
+            return .{ .models = .{ .request = request, .client = client.? } };
+        },
+        .responses, .chat_completions => |route| if (request.head.method == .POST) {
+            const protocol: Protocol = if (route == .responses) .responses else .chat_completions;
+            const pending = inference.prepare(gpa, allocator, &request, config.upstreams, protocol, client.?) catch |err| {
+                const status: std.http.Status, const body: []const u8 = switch (err) {
+                    error.InvalidRequest => .{ .bad_request, "{\"error\":\"invalid_request\"}\n" },
+                    error.UnknownUpstream => .{ .bad_request, "{\"error\":\"unknown_upstream\"}\n" },
+                    error.ProtocolMismatch => .{ .bad_request, "{\"error\":\"protocol_mismatch\"}\n" },
+                    error.StreamTooLong => .{ .payload_too_large, "{\"error\":\"request_too_large\"}\n" },
+                    error.HttpExpectationFailed => .{ .expectation_failed, "{\"error\":\"unsupported_expectation\"}\n" },
                     else => return err,
-                }
-            }
+                };
+                try respond(&request, status, body, client);
+                return null;
+            };
+            return .{ .inference = pending };
         },
         .unknown => {},
     }
+    try respond(&request, .not_found, "{\"error\":\"not_found\"}\n", client);
+    return null;
+}
 
+fn respond(request: *std.http.Server.Request, status: std.http.Status, body: []const u8, client: ?[]const u8) !void {
     const headers = [_]std.http.Header{
         .{ .name = "content-type", .value = "application/json" },
         .{ .name = "www-authenticate", .value = "Bearer" },
     };
-
-    // Send the final response without inviting or reading a body; this connection closes.
+    // Never invite or read a body for a completed local response.
     request.head.expect = null;
     try request.respond(body, .{
         .status = status,
         .keep_alive = false,
         .extra_headers = if (status == .unauthorized) &headers else headers[0..1],
     });
-
     logRequest(status, client);
-    return null;
 }
 
 fn logRequest(status: std.http.Status, client: ?[]const u8) void {
@@ -201,15 +211,15 @@ test "HTTP health, authentication, and routing" {
         .{ "POST /v1/responses HTTP/1.1\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\n\r\n", "401 Unauthorized", "unauthorized" },
         .{ "POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer wrong\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\n\r\n", "401 Unauthorized", "unauthorized" },
         .{ "POST /v1/responses HTTP/1.1\r\nExpect: unsupported\r\n\r\n", "401 Unauthorized", "unauthorized" },
-        .{ "POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer first-secret\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\n\r\n", "404 Not Found", "not_found" },
-        .{ "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer first-secret\r\n\r\n", "404 Not Found", "not_found" },
-        .{ "GET /v1/models?limit=1 HTTP/1.1\r\naUtHoRiZaTiOn: bearer second-secret\r\n\r\n", "404 Not Found", "not_found" },
+        .{ "POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer first-secret\r\nContent-Length: 2\r\n\r\n{}", "400 Bad Request", "invalid_request" },
+        .{ "POST /v1/models HTTP/1.1\r\nAuthorization: Bearer first-secret\r\n\r\n", "404 Not Found", "not_found" },
+        .{ "GET /unknown?limit=1 HTTP/1.1\r\naUtHoRiZaTiOn: bearer second-secret\r\n\r\n", "404 Not Found", "not_found" },
         .{ "GET /v1 HTTP/1.1\r\n\r\n", "401 Unauthorized", "unauthorized" },
         .{ "GET /unknown HTTP/1.1\r\n\r\n", "404 Not Found", "not_found" },
         .{ "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer first-secret\r\nAuthorization: Bearer second-secret\r\n\r\n", "401 Unauthorized", "unauthorized" },
     };
     const clients = [_]auth.Client{ auth.Client.init("pi", "first-secret"), auth.Client.init("dev", "second-secret") };
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = null };
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{} };
     inline for (cases) |case| {
         var reader = std.Io.Reader.fixed(case[0]);
         var writer = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -231,14 +241,14 @@ const TransportTest = struct {
     const fixture = @import("fixture");
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const payload = "{\"model\":\"demo\",\"stream\":true,\"opaque\":{\"nested\":[1,null,true]}}";
+    const payload = "{\"model\":\"test/demo\",\"stream\":true,\"opaque\":{\"nested\":[1,null,true]}}";
     const first = "data: {\"delta\":\"first\"}\n\n";
 
     fn connect(upstream_client: *std.http.Client, config: *const Config, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
-        return connectWithProvider(upstream_client, config, null, active, tasks);
+        return connectWithRegistry(upstream_client, config, null, active, tasks);
     }
 
-    fn connectWithProvider(upstream_client: *std.http.Client, config: *const Config, provider: ?*Provider, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
+    fn connectWithRegistry(upstream_client: *std.http.Client, config: *const Config, registry: ?*Registry, active: *std.atomic.Value(usize), tasks: *std.Io.Group) !std.Io.net.Stream {
         var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
         defer listener.deinit(io);
         const client = try listener.socket.address.connect(io, .{ .mode = .stream });
@@ -246,8 +256,35 @@ const TransportTest = struct {
         const accepted = try listener.accept(io);
         errdefer accepted.close(io);
         _ = active.fetchAdd(1, .monotonic);
-        try tasks.concurrent(io, handleConnection, .{ allocator, upstream_client, accepted, config, provider, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout) });
+        try tasks.concurrent(io, handle, .{ upstream_client, accepted, config, registry, active });
         return client;
+    }
+
+    fn handle(client: *std.http.Client, stream: std.Io.net.Stream, config: *const Config, registry: ?*Registry, active: *std.atomic.Value(usize)) void {
+        if (registry) |providers| {
+            handleConnection(allocator, client, stream, config, providers, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout));
+        } else {
+            var providers = Registry.init(allocator, io, config.upstreams) catch unreachable;
+            defer providers.deinit();
+            handleConnection(allocator, client, stream, config, &providers, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout));
+        }
+    }
+
+    fn exchange(upstream_client: *std.http.Client, config: *const Config, registry: *Registry, raw: []const u8) ![]u8 {
+        var active: std.atomic.Value(usize) = .init(0);
+        var tasks: std.Io.Group = .init;
+        defer tasks.cancel(io);
+        const client = try connectWithRegistry(upstream_client, config, registry, &active, &tasks);
+        defer client.close(io);
+        var buffer: [1024]u8 = undefined;
+        var writer = client.writer(io, &buffer);
+        try writer.interface.writeAll(raw);
+        try writer.interface.flush();
+        const result = try receive(client);
+        errdefer allocator.free(result);
+        try tasks.await(io);
+        try std.testing.expectEqual(0, active.load(.monotonic));
+        return result;
     }
 
     fn reset(client: std.Io.net.Stream) !void {
@@ -305,17 +342,17 @@ test "transport rejects deeply nested JSON without forwarding and serves the nex
     try fixture.start();
     const origin = try fixture.origin(T.allocator);
     defer T.allocator.free(origin);
-    var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
-    defer upstream.models.deinit(T.allocator);
-    try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+    var upstream: @import("config.zig").Upstream = .{ .name = "test", .base_url = origin };
+    defer upstream.aliases.deinit(T.allocator);
+    try upstream.aliases.map.put(T.allocator, "demo", "fixture-model");
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
     var active: std.atomic.Value(usize) = .init(0);
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(T.io);
     var payload: std.Io.Writer.Allocating = .init(T.allocator);
     defer payload.deinit();
-    try payload.writer.writeAll("{\"model\":\"demo\",\"input\":");
+    try payload.writer.writeAll("{\"model\":\"test/demo\",\"input\":");
     try payload.writer.splatByteAll('[', 300);
     try payload.writer.writeAll("null");
     try payload.writer.splatByteAll(']', 300);
@@ -375,13 +412,13 @@ test "transport socket relay preserves payload, isolates headers, and handles re
         try fixture.start();
         const origin = try fixture.origin(T.allocator);
         defer T.allocator.free(origin);
-        const url = try T.allocator.print("{s}/v1/responses", .{origin});
+        const url = try T.allocator.print("{s}/v1", .{origin});
         defer T.allocator.free(url);
-        var upstream: @import("config.zig").Upstream = .{ .url = url, .models = .{} };
-        defer upstream.models.deinit(T.allocator);
-        try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+        var upstream: @import("config.zig").Upstream = .{ .name = "test", .base_url = url };
+        defer upstream.aliases.deinit(T.allocator);
+        try upstream.aliases.map.put(T.allocator, "demo", "fixture-model");
         const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
         var active: std.atomic.Value(usize) = .init(0);
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(T.io);
@@ -443,11 +480,11 @@ test "transport incremental SSE survives half-close and resets before or after h
         try fixture.start();
         const origin = try fixture.origin(T.allocator);
         defer T.allocator.free(origin);
-        var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
-        defer upstream.models.deinit(T.allocator);
-        try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+        var upstream: @import("config.zig").Upstream = .{ .name = "test", .base_url = origin };
+        defer upstream.aliases.deinit(T.allocator);
+        try upstream.aliases.map.put(T.allocator, "demo", "fixture-model");
         const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
         var active: std.atomic.Value(usize) = .init(0);
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(T.io);
@@ -513,11 +550,11 @@ test "transport sequential inferences reuse only complete persistent upstream co
         try fixture.start();
         const origin = try fixture.origin(T.allocator);
         defer T.allocator.free(origin);
-        var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
-        defer upstream.models.deinit(T.allocator);
-        try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+        var upstream: @import("config.zig").Upstream = .{ .name = "test", .base_url = origin };
+        defer upstream.aliases.deinit(T.allocator);
+        try upstream.aliases.map.put(T.allocator, "demo", "fixture-model");
         const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
         var active: std.atomic.Value(usize) = .init(0);
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(T.io);
@@ -553,11 +590,11 @@ test "transport an upstream closing an idle pooled socket fails the next inferen
     try fixture.start();
     const origin = try fixture.origin(T.allocator);
     defer T.allocator.free(origin);
-    var upstream: @import("config.zig").Upstream = .{ .url = origin, .models = .{} };
-    defer upstream.models.deinit(T.allocator);
-    try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+    var upstream: @import("config.zig").Upstream = .{ .name = "test", .base_url = origin };
+    defer upstream.aliases.deinit(T.allocator);
+    try upstream.aliases.map.put(T.allocator, "demo", "fixture-model");
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
     var active: std.atomic.Value(usize) = .init(0);
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(T.io);
@@ -605,13 +642,15 @@ test "transport shared client isolates concurrent cancellation and remains usabl
     defer T.allocator.free(stalled_url);
     const healthy_url = try healthy.origin(T.allocator);
     defer T.allocator.free(healthy_url);
-    var upstream: @import("config.zig").Upstream = .{ .url = stalled_url, .models = .{} };
-    defer upstream.models.deinit(T.allocator);
-    try upstream.models.map.put(T.allocator, "demo", "fixture-model");
+    var upstream: @import("config.zig").Upstream = .{ .name = "test", .base_url = stalled_url };
+    defer upstream.aliases.deinit(T.allocator);
+    try upstream.aliases.map.put(T.allocator, "demo", "fixture-model");
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
     var healthy_config = config;
-    healthy_config.upstream.?.url = healthy_url;
+    var healthy_upstream = upstream;
+    healthy_upstream.base_url = healthy_url;
+    healthy_config.upstreams = &.{healthy_upstream};
     var active: std.atomic.Value(usize) = .init(0);
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(T.io);
@@ -676,32 +715,32 @@ test "transport unavailable SIWC credentials return 503 without sending inferenc
         );
     }
     var upstream: @import("provider.zig").Upstream = .{
-        .url = "https://api.openai.com/v1/responses",
-        .models = .{},
-        .auth = .{ .provider = .codex, .credentials_dir = directory },
+        .name = "test",
+        .base_url = "https://api.openai.com/v1",
+        .auth = .{ .codex = directory },
     };
-    defer upstream.models.deinit(a);
-    try upstream.models.map.put(a, "demo", "fixture-model");
-    var provider = try Provider.init(a, T.io, upstream);
-    defer provider.deinit();
+    defer upstream.aliases.deinit(a);
+    try upstream.aliases.map.put(a, "demo", "fixture-model");
+    var providers = try Registry.init(a, T.io, &.{upstream});
+    defer providers.deinit();
     // A terminal refresh failure with an expired token must fail closed. No
     // refresh worker or external network is needed to exercise this state.
-    provider.session.?.current.value = provider.session.?.current.value.registration();
+    providers.entries[0].session.?.current.value = providers.entries[0].session.?.current.value.registration();
     var fixture = try T.fixture.Fixture.init(a, T.io, &.{.{ .bytes = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n" }});
     defer fixture.deinit();
     try fixture.start();
     const origin = try fixture.origin(a);
     defer a.free(origin);
     // Any accidentally forwarded inference can only reach this local fixture.
-    upstream.url = origin;
+    upstream.base_url = origin;
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
     var upstream_client: std.http.Client = .{ .allocator = a, .io = T.io };
     defer upstream_client.deinit();
     var active: std.atomic.Value(usize) = .init(0);
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(T.io);
-    const client = try T.connectWithProvider(&upstream_client, &config, &provider, &active, &tasks);
+    const client = try T.connectWithRegistry(&upstream_client, &config, &providers, &active, &tasks);
     defer client.close(T.io);
     try T.send(client, false);
     const raw = try T.receive(client);
@@ -710,27 +749,27 @@ test "transport unavailable SIWC credentials return 503 without sending inferenc
     try std.testing.expect(std.mem.find(u8, raw, "503 Service Unavailable") != null);
     try std.testing.expect(std.mem.find(u8, raw, "upstream_credentials_unavailable") != null);
     try std.testing.expectEqual(0, fixture.count.load(.acquire));
-    try std.testing.expect(!provider.session.?.refreshing);
+    try std.testing.expect(!providers.entries[0].session.?.refreshing);
 }
 
 test "transport SIWC validates caller auth, JSON, and model aliases locally" {
     const a = std.testing.allocator;
     var upstream: @import("provider.zig").Upstream = .{
-        .url = "https://api.openai.com/v1/responses",
-        .models = .{},
-        .auth = .{ .provider = .codex },
+        .name = "test",
+        .base_url = "https://api.openai.com/v1",
+        .auth = .{ .codex = "/unused" },
     };
-    defer upstream.models.deinit(a);
-    try upstream.models.map.put(a, "demo", "upstream-model");
+    defer upstream.aliases.deinit(a);
+    try upstream.aliases.map.put(a, "demo", "upstream-model");
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstream = upstream };
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{upstream} };
     const cases = .{
-        .{ "wrong-key", "{\"model\":\"demo\",\"stream\":false,\"store\":true}", "401 Unauthorized", "unauthorized" },
+        .{ "wrong-key", "{\"model\":\"test/demo\",\"stream\":false,\"store\":true}", "401 Unauthorized", "unauthorized" },
         .{ "transport-secret", "invalid", "400 Bad Request", "invalid_request" },
         .{ "transport-secret", "[]", "400 Bad Request", "invalid_request" },
         .{ "transport-secret", "{}", "400 Bad Request", "invalid_request" },
         .{ "transport-secret", "{\"model\":null}", "400 Bad Request", "invalid_request" },
-        .{ "transport-secret", "{\"model\":\"unknown\"}", "400 Bad Request", "unknown_model" },
+        .{ "transport-secret", "{\"model\":\"unknown\"}", "400 Bad Request", "unknown_upstream" },
     };
     inline for (cases) |case| {
         const raw = try a.print("POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ case[0], case[1].len, case[1] });
@@ -754,7 +793,7 @@ test "transport oversized request is rejected before reading or inviting body" {
         .arena = undefined,
         .address = undefined,
         .clients = &clients,
-        .upstream = .{ .url = "http://localhost/v1/responses", .models = .{} },
+        .upstreams = &.{.{ .name = "test", .base_url = "http://localhost/v1" }},
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -766,4 +805,173 @@ test "transport oversized request is rejected before reading or inviting body" {
     try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed));
     try std.testing.expect(std.mem.startsWith(u8, writer.written(), "HTTP/1.1 413 "));
     try std.testing.expect(std.mem.find(u8, writer.written(), "100 Continue") == null);
+}
+
+test "transport models aggregate namespaces aliases and cached metadata while inference bypasses discovery" {
+    const T = TransportTest;
+    const a = T.allocator;
+    const catalog = "{\"object\":\"list\",\"data\":[{\"id\":\"shared\",\"created\":42},{\"id\":\"vendor/new-model\"}]}";
+    const catalog_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ catalog.len, catalog });
+    var responses_fixture = try T.fixture.Fixture.init(a, T.io, &.{
+        .{ .bytes = catalog_reply },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+    });
+    defer responses_fixture.deinit();
+    var chat_fixture = try T.fixture.Fixture.init(a, T.io, &.{
+        .{ .bytes = catalog_reply },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: [DONE]\n\n" },
+    });
+    defer chat_fixture.deinit();
+    try responses_fixture.start();
+    try chat_fixture.start();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    var upstreams = [_]@import("provider.zig").Upstream{
+        .{ .name = "responses", .base_url = try ra.print("{s}/v1", .{try responses_fixture.origin(ra)}), .auth = .{ .api_key = "responses-secret" } },
+        .{ .name = "chat", .base_url = try ra.print("{s}/v1", .{try chat_fixture.origin(ra)}), .protocol = .chat_completions, .auth = .{ .api_key = "chat-secret" } },
+    };
+    try upstreams[0].aliases.map.put(ra, "shared", "aliased-native");
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &upstreams };
+    var registry = try Registry.init(a, T.io, config.upstreams);
+    defer registry.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = T.io };
+    defer client.deinit();
+
+    // Startup and unauthorized discovery must never contact upstreams.
+    const rejected = try T.exchange(&client, &config, &registry, "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
+    defer a.free(rejected);
+    try std.testing.expect(std.mem.startsWith(u8, rejected, "HTTP/1.1 401 "));
+    try std.testing.expectEqual(0, responses_fixture.count.load(.acquire));
+    try std.testing.expectEqual(0, chat_fixture.count.load(.acquire));
+
+    for (0..2) |_| {
+        const raw = try T.exchange(&client, &config, &registry, "GET /v1/models?ignored=true HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\n\r\n");
+        defer a.free(raw);
+        try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 "));
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw[std.mem.find(u8, raw, "\r\n\r\n").? + 4 ..], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("list", parsed.value.object.get("object").?.string);
+        const data = parsed.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(4, data.len);
+        try std.testing.expectEqualStrings("responses/shared", data[0].object.get("id").?.string);
+        try std.testing.expectEqualStrings("responses/vendor/new-model", data[1].object.get("id").?.string);
+        try std.testing.expectEqualStrings("chat/shared", data[2].object.get("id").?.string);
+        try std.testing.expectEqualStrings("openai-completions", data[2].object.get("api").?.string);
+        try std.testing.expectEqual(@as(i64, 42), data[2].object.get("created").?.integer);
+        try std.testing.expect(std.mem.find(u8, raw, "secret") == null);
+        try std.testing.expectEqual(1, responses_fixture.count.load(.acquire));
+        try std.testing.expectEqual(1, chat_fixture.count.load(.acquire));
+    }
+
+    const cases = [_]struct { path: []const u8, payload: []const u8 }{
+        .{ .path = "/v1/responses", .payload = "{\"model\":\"responses/shared\",\"input\":[],\"stream\":false}" },
+        .{ .path = "/v1/chat/completions", .payload = "{\"model\":\"chat/vendor/not-in-catalog\",\"messages\":[],\"stream\":true,\"tools\":[]}" },
+    };
+    for (cases) |case| {
+        const request = try ra.print("POST {s} HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.path, case.payload.len, case.payload });
+        const raw = try T.exchange(&client, &config, &registry, request);
+        defer a.free(raw);
+        try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 "));
+    }
+    try responses_fixture.waitRequest();
+    try responses_fixture.waitRequest();
+    try chat_fixture.waitRequest();
+    try chat_fixture.waitRequest();
+    const responses_request = responses_fixture.requests[1].?;
+    const chat_request = chat_fixture.requests[1].?;
+    try std.testing.expect(std.mem.startsWith(u8, responses_request, "POST /v1/responses "));
+    try std.testing.expect(std.mem.find(u8, responses_request, "\"model\":\"aliased-native\"") != null);
+    try std.testing.expect(std.mem.startsWith(u8, chat_request, "POST /v1/chat/completions "));
+    try std.testing.expect(std.mem.find(u8, chat_request, "\"model\":\"vendor/not-in-catalog\"") != null);
+    for (responses_fixture.requests) |request| {
+        try std.testing.expect(std.mem.find(u8, request.?, "Bearer responses-secret") != null);
+        try std.testing.expect(std.mem.find(u8, request.?, "chat-secret") == null);
+        try std.testing.expect(std.mem.find(u8, request.?, "transport-secret") == null);
+    }
+    for (chat_fixture.requests) |request| {
+        try std.testing.expect(std.mem.find(u8, request.?, "Bearer chat-secret") != null);
+        try std.testing.expect(std.mem.find(u8, request.?, "responses-secret") == null);
+        try std.testing.expect(std.mem.find(u8, request.?, "transport-secret") == null);
+    }
+}
+
+test "transport discovery failure permits alias fallback and never gates inference or health" {
+    const T = TransportTest;
+    const a = T.allocator;
+    var fixture = try T.fixture.Fixture.init(a, T.io, &.{
+        .{ .bytes = "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n" },
+        .{ .bytes = "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n" },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" },
+    });
+    defer fixture.deinit();
+    try fixture.start();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const upstreams = [_]@import("provider.zig").Upstream{
+        .{ .name = "offline", .base_url = try ra.print("{s}/v1", .{try fixture.origin(ra)}) },
+    };
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &upstreams };
+    var registry = try Registry.init(a, T.io, config.upstreams);
+    defer registry.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = T.io };
+    defer client.deinit();
+    const failed = try T.exchange(&client, &config, &registry, "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\n\r\n");
+    defer a.free(failed);
+    try std.testing.expect(std.mem.startsWith(u8, failed, "HTTP/1.1 502 "));
+    var alias_upstream = upstreams[0];
+    try alias_upstream.aliases.map.put(ra, "fallback", "native");
+    const alias_config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{alias_upstream} };
+    var alias_registry = try Registry.init(a, T.io, alias_config.upstreams);
+    defer alias_registry.deinit();
+    const partial = try T.exchange(&client, &alias_config, &alias_registry, "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\n\r\n");
+    defer a.free(partial);
+    try std.testing.expect(std.mem.startsWith(u8, partial, "HTTP/1.1 200 "));
+    try std.testing.expect(std.mem.find(u8, partial, "offline/fallback") != null);
+    try std.testing.expectEqual(2, fixture.count.load(.acquire));
+    const health = try T.exchange(&client, &config, &registry, "GET /healthz HTTP/1.1\r\n\r\n");
+    defer a.free(health);
+    try std.testing.expect(std.mem.startsWith(u8, health, "HTTP/1.1 200 "));
+    const payload = "{\"model\":\"offline/new-model\",\"input\":[]}";
+    const request = try ra.print("POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
+    const inference_response = try T.exchange(&client, &config, &registry, request);
+    defer a.free(inference_response);
+    try std.testing.expect(std.mem.startsWith(u8, inference_response, "HTTP/1.1 200 "));
+    try std.testing.expectEqual(3, fixture.count.load(.acquire));
+}
+
+test "transport models keep healthy upstreams when another discovery fails" {
+    const T = TransportTest;
+    const a = T.allocator;
+    const body = "{\"data\":[{\"id\":\"model\"}]}";
+    var healthy = try T.fixture.Fixture.init(a, T.io, &.{.{ .bytes = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) }});
+    defer healthy.deinit();
+    var failed = try T.fixture.Fixture.init(a, T.io, &.{.{ .bytes = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n" }});
+    defer failed.deinit();
+    try healthy.start();
+    try failed.start();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const upstreams = [_]@import("provider.zig").Upstream{
+        .{ .name = "failed", .base_url = try failed.origin(ra) },
+        .{ .name = "healthy", .base_url = try healthy.origin(ra) },
+    };
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &upstreams };
+    var registry = try Registry.init(a, T.io, config.upstreams);
+    defer registry.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = T.io };
+    defer client.deinit();
+    const raw = try T.exchange(&client, &config, &registry, "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\n\r\n");
+    defer a.free(raw);
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 "));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw[std.mem.find(u8, raw, "\r\n\r\n").? + 4 ..], .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(1, data.len);
+    try std.testing.expectEqualStrings("healthy/model", data[0].object.get("id").?.string);
 }

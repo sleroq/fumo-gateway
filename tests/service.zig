@@ -64,16 +64,16 @@ test "session provider owns credential loading and authorization snapshots" {
     var storage = try Storage.init(3600);
     defer storage.deinit();
     var provider = try Provider.init(a, io, .{
-        .url = "https://api.openai.com/v1/responses",
-        .models = .{},
-        .auth = .{ .provider = .codex, .credentials_dir = storage.path },
+        .name = "codex",
+        .base_url = "https://api.openai.com/v1",
+        .auth = .{ .codex = storage.path },
     });
     defer provider.deinit();
     const header = (try provider.authorization(a)).?;
     defer a.free(header);
     try std.testing.expectEqualStrings("Bearer old-access", header);
     try std.testing.expect(!provider.session.?.refreshing);
-    var plain = try Provider.init(a, io, .{ .url = "http://localhost/v1/responses", .models = .{} });
+    var plain = try Provider.init(a, io, .{ .name = "public", .base_url = "http://localhost/v1" });
     defer plain.deinit();
     try std.testing.expectEqual(null, try plain.authorization(a));
 }

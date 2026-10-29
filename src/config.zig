@@ -3,7 +3,7 @@ const auth = @import("auth.zig");
 pub const Upstream = @import("provider.zig").Upstream;
 
 const Document = struct {
-    upstream: ?Upstream = null,
+    upstreams: std.json.ArrayHashMap(Upstream.Options) = .{},
     listen: []const u8 = "127.0.0.1:8080",
     clients: std.json.ArrayHashMap(struct { key_env: []const u8 }),
 };
@@ -12,7 +12,7 @@ pub const Config = struct {
     arena: std.heap.ArenaAllocator,
     address: std.Io.net.IpAddress,
     clients: []const auth.Client,
-    upstream: ?Upstream,
+    upstreams: []const Upstream,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, environ: *const std.process.Environ.Map) !Config {
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024));
@@ -26,10 +26,11 @@ pub const Config = struct {
         const allocator = arena.allocator();
 
         const document = try std.json.parseFromSliceLeaky(Document, allocator, text, .{ .allocate = .alloc_always });
-        var upstream = document.upstream;
-        if (upstream) |*value| {
-            try value.configure(allocator, environ);
+        const upstreams = try allocator.alloc(Upstream, document.upstreams.map.count());
+        for (upstreams, document.upstreams.map.keys(), document.upstreams.map.values()) |*upstream, name, options| {
+            upstream.* = try Upstream.configure(name, options, allocator, environ);
         }
+
         const address = std.Io.net.IpAddress.parseLiteral(document.listen) catch return error.InvalidListenAddress;
         if (address.getPort() == 0) return error.InvalidListenAddress;
         if (document.clients.map.count() == 0) return error.NoClients;
@@ -51,7 +52,7 @@ pub const Config = struct {
             }
         }
 
-        return .{ .arena = arena, .address = address, .clients = clients, .upstream = upstream };
+        return .{ .arena = arena, .address = address, .clients = clients, .upstreams = upstreams };
     }
 
     pub fn deinit(self: *Config) void {
@@ -73,7 +74,7 @@ test "configuration resolves environment keys and defaults to loopback" {
     try std.testing.expectEqualStrings("dev", auth.authenticate(config.clients, "Bearer second-secret").?);
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, config.address.ip4.bytes);
     try std.testing.expectEqual(8080, config.address.getPort());
-    try std.testing.expect(config.upstream == null);
+    try std.testing.expectEqual(0, config.upstreams.len);
 }
 
 test "invalid configuration fails before serving" {
@@ -100,78 +101,99 @@ test "invalid configuration fails before serving" {
     , &environ));
 }
 
-test "upstream preserves endpoint and model aliases in its arena" {
-    var environ = std.process.Environ.Map.init(std.testing.allocator);
+test "named upstreams own definitions, aliases, and resolved API keys in the config arena" {
+    const a = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(a);
     defer environ.deinit();
     try environ.put("PI_KEY", "secret");
-    const text = try std.testing.allocator.dupe(u8,
-        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"http://127.0.0.1:9090/v1/responses","models":{"demo":"fixture-model","other":"second-model"}}}
+    try environ.put("ZEN_KEY", "provider-secret");
+    const text = try a.dupe(u8,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"http://127.0.0.1:9090/v1/","aliases":{"fast":"native-model"}},"zen":{"base_url":"https://example.com/v1","protocol":"chat_completions","auth":{"provider":"api_key","key_env":"ZEN_KEY"}}}}
     );
-    var config = try Config.parse(std.testing.allocator, text, &environ);
+    var config = try Config.parse(a, text, &environ);
     defer config.deinit();
-    std.testing.allocator.free(text);
-    const upstream = config.upstream.?;
-    try std.testing.expectEqualStrings("http://127.0.0.1:9090/v1/responses", upstream.url);
-    try std.testing.expectEqualStrings("fixture-model", upstream.models.map.get("demo").?);
-    try std.testing.expectEqualStrings("second-model", upstream.models.map.get("other").?);
+    a.free(text);
+    try environ.put("ZEN_KEY", "changed");
+    try std.testing.expectEqual(2, config.upstreams.len);
+    try std.testing.expectEqualStrings("codex", config.upstreams[0].name);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9090/v1", config.upstreams[0].base_url);
+    try std.testing.expectEqualStrings("native-model", config.upstreams[0].aliases.map.get("fast").?);
+    try std.testing.expectEqual(.chat_completions, config.upstreams[1].protocol);
+    try std.testing.expectEqualStrings("provider-secret", config.upstreams[1].auth.api_key);
 }
 
-test "SIWC configuration resolves private storage and pins the credential destination" {
-    var environ = std.process.Environ.Map.init(std.testing.allocator);
+test "SIWC configuration resolves private storage and pins inference and discovery destination" {
+    const a = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(a);
     defer environ.deinit();
     try environ.put("PI_KEY", "secret");
     try environ.put("HOME", "/home/test");
-    var config = try Config.parse(std.testing.allocator,
-        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"https://api.openai.com/v1/responses","models":{"demo":"model"},"auth":{"provider":"codex"}}}
+    var config = try Config.parse(a,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"https://api.openai.com/v1","auth":{"provider":"codex"}}}}
     , &environ);
     defer config.deinit();
-    try std.testing.expectEqualStrings("/home/test/.local/state/fumo-gateway", config.upstream.?.auth.?.credentials_dir.?);
-    const explicit =
-        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"https://api.openai.com/v1/responses","models":{"demo":"model"},"auth":{"provider":"codex","credentials_dir":"/private/credentials"}}}
-    ;
-    var configured = try Config.parse(std.testing.allocator, explicit, &environ);
-    defer configured.deinit();
-    try std.testing.expectEqualStrings("/private/credentials", configured.upstream.?.auth.?.credentials_dir.?);
-    for ([_][]const u8{ "http://api.openai.com/v1/responses", "https://example.com/v1/responses", "https://api.openai.com/other", "https://api.openai.com:443/v1/responses" }) |url| {
-        const text = try std.testing.allocator.print(
-            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"{s}","models":{{"demo":"model"}},"auth":{{"provider":"codex"}}}}}}
+    try std.testing.expectEqualStrings("/home/test/.local/state/fumo-gateway", config.upstreams[0].auth.codex);
+    var explicit = try Config.parse(a,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"https://api.openai.com/v1","auth":{"provider":"codex","credentials_dir":"/private/credentials"}}}}
+    , &environ);
+    defer explicit.deinit();
+    try std.testing.expectEqualStrings("/private/credentials", explicit.upstreams[0].auth.codex);
+    for ([_][]const u8{ "http://api.openai.com/v1", "https://example.com/v1", "https://api.openai.com/other", "https://api.openai.com:443/v1" }) |url| {
+        const text = try a.print(
+            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstreams":{{"codex":{{"base_url":"{s}","auth":{{"provider":"codex"}}}}}}}}
         , .{url});
-        defer std.testing.allocator.free(text);
-        try std.testing.expectError(error.InvalidCodexEndpoint, Config.parse(std.testing.allocator, text, &environ));
+        defer a.free(text);
+        try std.testing.expectError(error.InvalidCodexEndpoint, Config.parse(a, text, &environ));
     }
-    try std.testing.expectError(error.InvalidDirectory, Config.parse(std.testing.allocator,
-        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstream":{"url":"https://api.openai.com/v1/responses","models":{"demo":"model"},"auth":{"provider":"codex","credentials_dir":""}}}
+    try std.testing.expectError(error.InvalidCodexEndpoint, Config.parse(a,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"https://api.openai.com/v1","protocol":"chat_completions","auth":{"provider":"codex"}}}}
+    , &environ));
+    try std.testing.expectError(error.InvalidDirectory, Config.parse(a,
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"https://api.openai.com/v1","auth":{"provider":"codex","credentials_dir":""}}}}
     , &environ));
 }
 
-test "invalid upstream configuration is rejected" {
-    var environ = std.process.Environ.Map.init(std.testing.allocator);
+test "invalid upstream definitions and credentials fail before serving" {
+    const a = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(a);
     defer environ.deinit();
     try environ.put("PI_KEY", "secret");
     const invalid_urls = [_][]const u8{
-        "",                                              "/v1/responses",                         "ftp://example.com/v1/responses",
-        "http:///v1/responses",                          "http://:9090/v1/responses",             "http://user@example.com/v1/responses",
-        "http://user:password@example.com/v1/responses", "http://example.com/v1/responses?",      "http://example.com/v1/responses#",
-        "http://example.com:0/v1/responses",             "http://example.com:65536/v1/responses", "http://example.com:bad/v1/responses",
-        "http://example.com:/v1/responses",
+        "",                            "/v1",                                 "ftp://example.com/v1",   "http:///v1",             "http://:9090/v1",
+        "http://user@example.com/v1",  "http://user:password@example.com/v1", "http://example.com/v1?", "http://example.com/v1#", "http://example.com:0/v1",
+        "http://example.com:65536/v1", "http://example.com:bad/v1",           "http://example.com:/v1",
     };
     for (invalid_urls) |url| {
-        const text = try std.testing.allocator.print(
-            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"{s}","models":{{"demo":"model"}}}}}}
+        const text = try a.print(
+            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstreams":{{"demo":{{"base_url":"{s}"}}}}}}
         , .{url});
-        defer std.testing.allocator.free(text);
-        try std.testing.expectError(error.InvalidUpstreamUrl, Config.parse(std.testing.allocator, text, &environ));
+        defer a.free(text);
+        try std.testing.expectError(error.InvalidUpstreamUrl, Config.parse(a, text, &environ));
     }
     const cases = .{
-        .{ "{}", error.NoUpstreamModels },
-        .{ "{\"\":\"model\"}", error.EmptyModelAlias },
-        .{ "{\"demo\":\"\"}", error.EmptyUpstreamModel },
+        .{ "", "{\"base_url\":\"http://localhost/v1\"}", error.InvalidUpstreamName },
+        .{ "bad/name", "{\"base_url\":\"http://localhost/v1\"}", error.InvalidUpstreamName },
+        .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"aliases\":{\"\":\"model\"}}", error.EmptyModelAlias },
+        .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"aliases\":{\"fast\":\"\"}}", error.EmptyUpstreamModel },
+        .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"auth\":{\"provider\":\"api_key\"}}", error.InvalidUpstreamAuth },
+        .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"auth\":{\"provider\":\"api_key\",\"key_env\":\"MISSING\"}}", error.MissingUpstreamKey },
     };
     inline for (cases) |case| {
-        const text = try std.testing.allocator.print(
-            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstream":{{"url":"https://example.com/v1/responses","models":{s}}}}}
-        , .{case[0]});
-        defer std.testing.allocator.free(text);
-        try std.testing.expectError(case[1], Config.parse(std.testing.allocator, text, &environ));
+        const text = try a.print(
+            \\{{"clients":{{"pi":{{"key_env":"PI_KEY"}}}},"upstreams":{{"{s}":{s}}}}}
+        , .{ case[0], case[1] });
+        defer a.free(text);
+        try std.testing.expectError(case[2], Config.parse(a, text, &environ));
+    }
+    for ([_][]const u8{ "", "bad\r\nkey" }) |key| {
+        try environ.put("API_KEY", key);
+        const text =
+            \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"demo":{"base_url":"http://localhost/v1","auth":{"provider":"api_key","key_env":"API_KEY"}}}}
+        ;
+        if (key.len == 0) {
+            try std.testing.expectError(error.EmptyUpstreamKey, Config.parse(a, text, &environ));
+        } else {
+            try std.testing.expectError(error.InvalidUpstreamKey, Config.parse(a, text, &environ));
+        }
     }
 }

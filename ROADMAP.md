@@ -15,9 +15,10 @@
 - No server-side agent loop or tool execution.
 
 ### Configuration and access
-- Declarative configuration for upstreams, supported models/protocols, aliases, client keys, and outbound proxies.
+- Declarative configuration for named upstreams, native protocols, optional model aliases, client keys, and outbound proxies.
+- Namespaced model routing without a gateway-maintained allowlist; aggregate provider discovery through authenticated `/v1/models` with lazy in-memory caching.
 - Secrets supplied separately from configuration.
-- Configuration changes take effect on restart; only OAuth credential state is mutable.
+- Configuration changes take effect on restart; OAuth credentials and ephemeral discovery caches are the only mutable provider state.
 - Multiple labeled client keys; no management API or configuration UI.
 - HTTP CONNECT and SOCKS5 proxy support, applied consistently to inference, authentication, and supporting upstream calls.
 
@@ -41,7 +42,18 @@ Universal protocol translation, WebSockets, automatic model-family guessing, acc
 - ChatGPT auth and sse streaming - https://github.com/router-for-me/CLIProxyAPI
 - Opencode Go - https://github.com/massiveits/opencode-go-cliproxyapi
 
+## Implemented foundation
+
+- Named upstreams with SIWC or environment-backed bearer API keys.
+- Native Responses and Chat Completions relay with namespace/alias resolution, streaming, cancellation, and shared outbound pooling.
+- Authenticated OpenAI-compatible `/v1/models`: SIWC and standard catalog normalization, lazy per-provider cache, stale/partial results, and optional aliases. Discovery never gates inference.
+- Fixture coverage for routing, credential isolation, cache lifetime/refresh, and transport behavior. Live Pi/OpenCode acceptance is still required.
+
 ## Current limitations
+
+- Outbound proxies and Prometheus metrics are not implemented yet.
+- Protocol is configured per upstream; mixed-protocol catalogs are not classified by model family. Anthropic Messages is not supported.
+- Pi/OpenCode custom-provider model pickers still need client configuration or a discovery integration; `/v1/models` alone does not install models into those clients.
 
 - Concurrency is implemented via worker threads and std.Id.Threaded. With SSE this will likely cause a lot of workers to be waiting for idle SSE connections and needs to be fixed in the future
 - WebSockets would be cool to have for codex but it's probably very complex
