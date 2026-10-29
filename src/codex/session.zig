@@ -15,7 +15,6 @@ pub const Session = struct {
     mutex: Io.Mutex = .init,
     workers: Io.Group = .init,
     refreshing: bool = false,
-    reauthentication_required: bool = false,
     retry_at: ?Io.Timestamp = null,
 
     pub const Options = struct {
@@ -29,6 +28,7 @@ pub const Session = struct {
         const owned_directory = try allocator.dupe(u8, directory);
         errdefer allocator.free(owned_directory);
         const current = try storage.load(allocator, io, directory);
+        errdefer current.deinit();
         return .{ .allocator = allocator, .io = io, .directory = owned_directory, .current = current };
     }
 
@@ -56,7 +56,7 @@ pub const Session = struct {
     /// Called with the mutex held. concurrent, unlike async, cannot execute the
     /// worker inline or tie its lifetime to the requesting task.
     fn startRefresh(self: *Session) void {
-        if (self.refreshing or self.reauthentication_required) return;
+        if (self.refreshing or self.current.value.refresh_token.len == 0 or self.current.value.refresh_status == .invalid_client) return;
         if (self.retry_at) |retry_at| {
             if (Io.Timestamp.compare(Io.Clock.awake.now(self.io), .lt, retry_at)) return;
         }
@@ -68,10 +68,21 @@ pub const Session = struct {
 
     fn refresh(self: *Session) void {
         self.rotate() catch |err| {
+            const retained = Refresh.recovery(self.current.value, err);
+            if (retained) |credentials| {
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                storage.save(self.allocator, self.io, self.directory, credentials) catch |save_err| {
+                    std.log.err("event=siwc_recovery_save_failed error={s}", .{@errorName(save_err)});
+                };
+            }
             self.mutex.lockUncancelable(self.io);
+            if (retained) |credentials| self.current.value = credentials;
             self.finishFailure(err);
             self.mutex.unlock(self.io);
             std.log.warn("event=siwc_refresh_failed error={s}", .{@errorName(err)});
+            if (err == error.ReauthenticationRequired) std.log.warn("Run auth login codex with the same credentials directory to reauthorize the saved registration.", .{});
+            if (err == error.InvalidClient) std.log.warn("SIWC renewal stopped: check the saved client configuration before reauthorizing.", .{});
         };
     }
 
@@ -108,8 +119,8 @@ pub const Session = struct {
     /// Called with the mutex held, including after cancellation.
     fn finishFailure(self: *Session, err: anyerror) void {
         self.refreshing = false;
-        if (err == error.ReauthenticationRequired) {
-            self.reauthentication_required = true;
+        if (err == error.ReauthenticationRequired or err == error.InvalidClient) {
+            self.retry_at = null;
         } else {
             self.retry_at = Io.Clock.awake.now(self.io).addDuration(self.options.retry_delay);
         }

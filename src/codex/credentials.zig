@@ -1,82 +1,35 @@
 const std = @import("std");
 const Io = std.Io;
-const max_size = 1024 * 1024;
 
-/// Structural validation only: persisted tokens are not proof of authentication.
 pub const Credentials = struct {
-    access_token: []const u8,
-    refresh_token: []const u8,
-    id_token: []const u8,
-    client_id: []const u8,
+    // Keep the original flat field names so existing SIWC records load without
+    // rewriting them. Missing token fields represent a registration, not a session.
     device_id: []const u8,
-    scope: []const u8,
-    expires_at: i64,
-    obtained_at: i64,
+    client_id: []const u8 = "",
+    access_token: []const u8 = "",
+    refresh_token: []const u8 = "",
+    id_token: []const u8 = "",
+    scope: []const u8 = "",
+    expires_at: i64 = 0,
+    obtained_at: i64 = 0,
+    refresh_status: enum { ready, invalid_client } = .ready,
 
-    pub fn validate(self: Credentials) !void {
-        inline for (.{ "access_token", "refresh_token", "id_token", "client_id", "device_id", "scope" }) |field| {
-            if (std.mem.trim(u8, @field(self, field), " \t\r\n\x0b\x0c").len == 0)
-                return error.InvalidCredentials;
-        }
-        // Access tokens are inserted into an HTTP Bearer header by the service.
-        for (self.access_token) |byte| {
-            if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return error.InvalidCredentials;
-        }
-        if (self.expires_at <= 0) return error.InvalidCredentials;
-        var scopes = std.mem.tokenizeAny(u8, self.scope, " \t\r\n\x0b\x0c");
-        while (scopes.next()) |scope| {
-            if (std.mem.eql(u8, scope, "chatgpt.tokens.use.direct")) return;
-        }
-        return error.InvalidCredentials;
+    pub fn registration(self: Credentials) Credentials {
+        return .{ .device_id = self.device_id, .client_id = self.client_id };
     }
 };
 
 fn openDirectory(io: Io, directory: []const u8, create: bool) !Io.Dir {
-    const path = std.mem.trimEnd(u8, directory, "/");
-    if (path.len == 0 or std.mem.eql(u8, std.fs.path.basename(path), ".") or
-        std.mem.eql(u8, std.fs.path.basename(path), "..")) return error.InvalidDirectory;
-    if (create) _ = try Io.Dir.cwd().createDirPathStatus(io, path, .fromMode(0o700));
-    const dir = try Io.Dir.cwd().openDir(io, path, .{ .follow_symlinks = false });
-    errdefer dir.close(io);
-    try privatePermissions(try dir.stat(io));
-    return dir;
+    if (create) _ = try Io.Dir.cwd().createDirPathStatus(io, directory, .fromMode(0o700));
+    return Io.Dir.cwd().openDir(io, directory, .{});
 }
 
-fn privatePermissions(stat: Io.File.Stat) !void {
-    if (stat.permissions.toMode() & 0o077 != 0) return error.InsecurePermissions;
-}
-
-fn checkFile(stat: Io.File.Stat) !void {
-    if (stat.kind == .sym_link) return error.SymlinkNotAllowed;
-    if (stat.kind != .file) return error.InvalidCredentialFile;
-    try privatePermissions(stat);
-}
-
-fn checkExistingFile(io: Io, dir: Io.Dir) !void {
-    if (dir.statFile(io, "codex.json", .{ .follow_symlinks = false })) |stat| {
-        try checkFile(stat);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-}
-
-/// Check private storage before browser authentication without reading or writing credentials.
-pub fn preflight(io: Io, directory: []const u8) !void {
-    const dir = try openDirectory(io, directory, true);
-    defer dir.close(io);
-    try checkExistingFile(io, dir);
-}
-
-/// Explicit login replaces the one provider credential; no merge or locking policy.
+/// One host, one registration, and an optional token session; no locking policy.
 pub fn save(allocator: std.mem.Allocator, io: Io, directory: []const u8, credentials: Credentials) !void {
-    try credentials.validate();
     const json = try std.json.Stringify.valueAlloc(allocator, credentials, .{});
     defer allocator.free(json);
-    if (json.len > max_size) return error.CredentialsTooLarge;
     const dir = try openDirectory(io, directory, true);
     defer dir.close(io);
-    try checkExistingFile(io, dir);
     // std.Io's atomic file uses an exclusive, unique same-directory temporary
     // for replacement, and removes it on deinit if writing or rename fails.
     var atomic = try dir.createFileAtomic(io, "codex.json", .{
@@ -92,21 +45,10 @@ pub fn save(allocator: std.mem.Allocator, io: Io, directory: []const u8, credent
 pub fn load(allocator: std.mem.Allocator, io: Io, directory: []const u8) !std.json.Parsed(Credentials) {
     const dir = try openDirectory(io, directory, false);
     defer dir.close(io);
-    try checkExistingFile(io, dir);
-    const file = try dir.openFile(io, "codex.json", .{ .follow_symlinks = false });
-    defer file.close(io);
-    const stat = try file.stat(io);
-    try checkFile(stat);
-    if (stat.size > max_size) return error.CredentialsTooLarge;
-    // Read at most limit+1, also bounding files that grow after stat.
-    const bytes = try allocator.alloc(u8, max_size + 1);
+
+    const bytes = try dir.readFileAlloc(io, "codex.json", allocator, .unlimited);
     defer allocator.free(bytes);
-    const len = try file.readPositionalAll(io, bytes, 0);
-    if (len > max_size) return error.CredentialsTooLarge;
-    const parsed = try std.json.parseFromSlice(Credentials, allocator, bytes[0..len], .{ .allocate = .alloc_always });
-    errdefer parsed.deinit();
-    try parsed.value.validate();
-    return parsed;
+    return std.json.parseFromSlice(Credentials, allocator, bytes, .{ .allocate = .alloc_always });
 }
 
 /// Reject nonempty relative XDG_STATE_HOME rather than silently writing elsewhere.
@@ -118,6 +60,7 @@ pub fn defaultDirectory(allocator: std.mem.Allocator, environ: *const std.proces
             return std.fs.path.join(allocator, &.{ xdg, "fumo-gateway" });
         }
     }
+
     const home = environ.get("HOME") orelse return error.HomeNotFound;
     if (!std.fs.path.isAbsolute(home)) return error.InvalidHome;
     return std.fs.path.join(allocator, &.{ home, ".local", "state", "fumo-gateway" });
@@ -134,10 +77,7 @@ test "roundtrip, replacement, directory and file permissions" {
     defer a.free(root);
     const path = try std.fs.path.join(a, &.{ root, "credentials" });
     defer a.free(path);
-    try preflight(io, path);
-    try std.testing.expectError(error.FileNotFound, load(a, io, path));
     try save(a, io, path, example);
-    try preflight(io, path);
     var parsed = try load(a, io, path);
     try std.testing.expectEqualStrings("access", parsed.value.access_token);
     parsed.deinit();
@@ -151,25 +91,6 @@ test "roundtrip, replacement, directory and file permissions" {
     defer dir.close(io);
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), (try dir.stat(io)).permissions.toMode() & 0o777);
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (try dir.statFile(io, "codex.json", .{})).permissions.toMode() & 0o777);
-    try dir.setFilePermissions(io, "codex.json", .fromMode(0o644), .{});
-    try std.testing.expectError(error.InsecurePermissions, load(a, io, path));
-    try std.testing.expectError(error.InsecurePermissions, preflight(io, path));
-    try dir.setPermissions(io, .fromMode(0o755));
-    try std.testing.expectError(error.InsecurePermissions, save(a, io, path, example));
-}
-
-test "required values and expiry" {
-    var invalid = example;
-    invalid.refresh_token = " \t\n";
-    try std.testing.expectError(error.InvalidCredentials, invalid.validate());
-    invalid = example;
-    invalid.expires_at = 0;
-    try std.testing.expectError(error.InvalidCredentials, invalid.validate());
-    for ([_][]const u8{ "access token", "access\ttoken", "access\r\nx-header: value", "access\x00", "access\x7f" }) |token| {
-        invalid = example;
-        invalid.access_token = token;
-        try std.testing.expectError(error.InvalidCredentials, invalid.validate());
-    }
 }
 
 test "default state paths" {
@@ -193,7 +114,37 @@ test "default state paths" {
     try std.testing.expectEqualStrings(home_path, empty_path);
 }
 
-test "missing, malformed, oversized and symlink credentials are rejected" {
+test "missing and malformed credentials retain JSON schema checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    try std.testing.expectError(error.FileNotFound, load(a, io, path));
+    try tmp.dir.writeFile(io, .{ .sub_path = "codex.json", .data = "{}" });
+    try std.testing.expectError(error.MissingField, load(a, io, path));
+}
+
+test "saved contents are trusted without semantic or size validation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    const token = try a.alloc(u8, 1024 * 1024 + 1);
+    defer a.free(token);
+    @memset(token, ' ');
+    const saved: Credentials = .{ .device_id = "", .access_token = token };
+    try save(a, io, path, saved);
+    const parsed = try load(a, io, path);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(saved.device_id, parsed.value.device_id);
+    try std.testing.expectEqualStrings(token, parsed.value.access_token);
+}
+
+test "current flat SIWC records retain registration without usable tokens" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -201,45 +152,22 @@ test "missing, malformed, oversized and symlink credentials are rejected" {
     try tmp.dir.setPermissions(io, .fromMode(0o700));
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
-    try std.testing.expectError(error.FileNotFound, load(a, io, path));
     const file = try tmp.dir.createFile(io, "codex.json", .{ .permissions = .fromMode(0o600) });
-    defer file.close(io);
-    try file.writeStreamingAll(io, "{}");
-    try std.testing.expectError(error.MissingField, load(a, io, path));
-    try file.writePositionalAll(io, " ", max_size);
-    try std.testing.expectError(error.CredentialsTooLarge, load(a, io, path));
-    try tmp.dir.deleteFile(io, "codex.json");
-    try tmp.dir.symLink(io, "missing", "codex.json", .{});
-    try std.testing.expectError(error.SymlinkNotAllowed, save(a, io, path, example));
-    try std.testing.expectError(error.SymlinkNotAllowed, preflight(io, path));
-    if (load(a, io, path)) |parsed| {
-        parsed.deinit();
-        return error.TestUnexpectedResult;
-    } else |_| {}
-    try tmp.dir.symLink(io, ".", "linked", .{ .is_directory = true });
-    const linked = try std.fs.path.join(a, &.{ path, "linked" });
-    defer a.free(linked);
-    if (save(a, io, linked, example)) |_| {
-        return error.TestUnexpectedResult;
-    } else |_| {}
+    try file.writeStreamingAll(io,
+        \\{"device_id":"saved-host","client_id":"issued-client","access_token":"old-access","refresh_token":"old-refresh","id_token":"old-id","scope":"openid","expires_at":0,"obtained_at":12}
+    );
+    file.close(io);
+    const old = try load(a, io, path);
+    defer old.deinit();
+    try save(a, io, path, old.value.registration());
+    const retained = try load(a, io, path);
+    defer retained.deinit();
+    try std.testing.expectEqualStrings("saved-host", retained.value.device_id);
+    try std.testing.expectEqualStrings("issued-client", retained.value.client_id);
+    try std.testing.expectEqualStrings("", retained.value.refresh_token);
 }
 
-test "SIWC metadata and exact direct scope are required" {
-    inline for (.{ "access_token", "refresh_token", "id_token", "client_id", "device_id", "scope" }) |field| {
-        var invalid = example;
-        @field(invalid, field) = " \t\r\n";
-        try std.testing.expectError(error.InvalidCredentials, invalid.validate());
-    }
-    var credentials = example;
-    for ([_][]const u8{ "openid", "chatgpt.tokens.use.direct.extra", "prefixchatgpt.tokens.use.direct" }) |scope| {
-        credentials.scope = scope;
-        try std.testing.expectError(error.InvalidCredentials, credentials.validate());
-    }
-    credentials.scope = "openid\tchatgpt.tokens.use.direct\r\nprofile";
-    try credentials.validate();
-}
-
-test "private legacy JSON can be replaced but cannot be loaded" {
+test "pre-SIWC records without registration metadata cannot be loaded" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -252,14 +180,12 @@ test "private legacy JSON can be replaced but cannot be loaded" {
         \\{"access_token":"access","refresh_token":"refresh","id_token":"id","expires_at":123,"obtained_at":12}
     );
     file.close(io);
-    try preflight(io, path);
     try std.testing.expectError(error.MissingField, load(a, io, path));
     const legacy = try tmp.dir.createFile(io, "codex.json", .{ .permissions = .fromMode(0o600) });
     try legacy.writeStreamingAll(io,
         \\{"access_token":"access","refresh_token":"refresh","id_token":"id","account_id":"account","expires_at":123,"obtained_at":12}
     );
     legacy.close(io);
-    try preflight(io, path);
     try std.testing.expectError(error.UnknownField, load(a, io, path));
     try save(a, io, path, example);
     const parsed = try load(a, io, path);

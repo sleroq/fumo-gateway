@@ -6,7 +6,8 @@ const io = std.testing.io;
 const success_body = "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"id_token\":\"new-id\",\"expires_in\":3600,\"scope\":\"chatgpt.tokens.use.direct\"}";
 const success = response("200 OK", success_body);
 const transient = response("500 Internal Server Error", "{\"error\":\"server_error\"}");
-const invalid = response("400 Bad Request", "{\"error\":\"invalid_grant\"}");
+const invalid = response("400 Bad Request", "{\"error\":\"refresh_token_reused\"}");
+const invalid_client = response("400 Bad Request", "{\"error\":\"invalid_client\"}");
 
 fn response(comptime status: []const u8, comptime body: []const u8) []const u8 {
     return std.fmt.comptimePrint("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, body.len, body });
@@ -154,19 +155,28 @@ test "session failed durable save never publishes replacement" {
     var session = try Session.init(a, io, storage.path);
     defer session.deinit();
     configure(&session, origin);
-    try storage.tmp.dir.setFilePermissions(io, "codex.json", .fromMode(0o644), .{});
+    try storage.tmp.dir.rename("codex.json", storage.tmp.dir, "backup.json", io);
+    try storage.tmp.dir.createDir(io, "codex.json", .default_dir);
     try authorize(&session, "Bearer old-access");
     try session.workers.await(io);
     try authorize(&session, "Bearer old-access");
+    try storage.tmp.dir.deleteDir(io, "codex.json");
+    try storage.tmp.dir.rename("backup.json", storage.tmp.dir, "codex.json", io);
     try storage.expectSaved("old-access");
     try std.testing.expect(session.retry_at != null);
 }
 
-test "session transient failure cools down and retries only on demand; invalid grant is terminal" {
-    for ([_]bool{ false, true }) |terminal| {
+test "session transient failures retry; unusable renewal and invalid client survive restart without retry" {
+    const Failure = enum { transient, unusable, invalid_client };
+    for (std.enums.values(Failure)) |failure| {
+        const terminal = failure != .transient;
         var storage = try Storage.init(60);
         defer storage.deinit();
-        var fixture = try local.Fixture.init(a, io, &.{ .{ .bytes = if (terminal) invalid else transient }, .{ .bytes = success } });
+        var fixture = try local.Fixture.init(a, io, &.{ .{ .bytes = switch (failure) {
+            .transient => transient,
+            .unusable => invalid,
+            .invalid_client => invalid_client,
+        } }, .{ .bytes = success } });
         defer fixture.deinit();
         try fixture.start();
         const origin = try fixture.origin(a);
@@ -176,18 +186,42 @@ test "session transient failure cools down and retries only on demand; invalid g
         configure(&session, origin);
         try authorize(&session, "Bearer old-access");
         try session.workers.await(io);
-        for (0..4) |_| try authorize(&session, "Bearer old-access");
+        if (failure == .unusable) {
+            try std.testing.expectError(error.CredentialsUnavailable, session.authorization(a));
+            try std.testing.expectEqualStrings("client", session.current.value.client_id);
+            try std.testing.expectEqualStrings("device", session.current.value.device_id);
+        } else for (0..4) |_| try authorize(&session, "Bearer old-access");
         try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
         // Move the recorded deadline into the past instead of sleeping through
         // a wall-clock cooldown. There is no worker after the join above.
         session.retry_at = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(-1));
         try std.testing.expect(!session.refreshing);
         try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
-        try authorize(&session, "Bearer old-access");
+        if (failure == .unusable) {
+            try std.testing.expectError(error.CredentialsUnavailable, session.authorization(a));
+        } else try authorize(&session, "Bearer old-access");
         try session.workers.await(io);
         try std.testing.expectEqual(@as(usize, if (terminal) 1 else 2), fixture.count.load(.acquire));
-        try authorize(&session, if (terminal) "Bearer old-access" else "Bearer new-access");
-        try storage.expectSaved(if (terminal) "old-access" else "new-access");
+        switch (failure) {
+            .unusable => {
+                try storage.expectSaved("");
+                var restarted = try Session.init(a, io, storage.path);
+                defer restarted.deinit();
+                try std.testing.expectError(error.CredentialsUnavailable, restarted.authorization(a));
+            },
+            .invalid_client => {
+                try storage.expectSaved("old-access");
+                var restarted = try Session.init(a, io, storage.path);
+                defer restarted.deinit();
+                configure(&restarted, origin);
+                try authorize(&restarted, "Bearer old-access");
+                try std.testing.expect(!restarted.refreshing);
+            },
+            .transient => {
+                try authorize(&session, "Bearer new-access");
+                try storage.expectSaved("new-access");
+            },
+        }
     }
 }
 

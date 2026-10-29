@@ -686,7 +686,7 @@ test "transport unavailable SIWC credentials return 503 without sending inferenc
     defer provider.deinit();
     // A terminal refresh failure with an expired token must fail closed. No
     // refresh worker or external network is needed to exercise this state.
-    provider.session.?.reauthentication_required = true;
+    provider.session.?.current.value = provider.session.?.current.value.registration();
     var fixture = try T.fixture.Fixture.init(a, T.io, &.{.{ .bytes = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n" }});
     defer fixture.deinit();
     try fixture.start();

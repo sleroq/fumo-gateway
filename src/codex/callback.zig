@@ -28,17 +28,19 @@ pub const Callback = struct {
 
     /// The caller owns the deadline and must deinit the listener after waiting.
     /// Only the returned grant is allocated in the caller's allocator.
-    pub fn wait(self: *Callback, allocator: std.mem.Allocator, io: std.Io, expected_state: []const u8) !Grant {
+    pub fn wait(self: *Callback, allocator: std.mem.Allocator, io: std.Io, expected_state: []const u8, expected_client: ?[]const u8) !Grant {
         while (true) {
             const stream = try self.server.accept(io);
             defer stream.close(io);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
+
             var read_buffer: [16384]u8 = undefined;
             var write_buffer: [1024]u8 = undefined;
             var reader = stream.reader(io, &read_buffer);
             var writer = stream.writer(io, &write_buffer);
             var server = std.http.Server.init(&reader.interface, &writer.interface);
+
             var request = server.receiveHead() catch {
                 if (reader.err) |err| switch (err) {
                     error.Canceled => return error.Canceled,
@@ -54,7 +56,8 @@ pub const Callback = struct {
                 try io.checkCancel();
                 continue;
             };
-            const grant = parse(arena.allocator(), request.head.method, request.head.target, expected_state) catch |err| {
+
+            const grant = parse(arena.allocator(), request.head.method, request.head.target, expected_state, expected_client) catch |err| {
                 const status: std.http.Status = switch (err) {
                     error.NotFound => .not_found,
                     error.MethodNotAllowed => .method_not_allowed,
@@ -66,10 +69,12 @@ pub const Callback = struct {
                 try io.checkCancel();
                 continue;
             };
+
             const code = try allocator.dupe(u8, grant.code);
             errdefer allocator.free(code);
             const client_id = try allocator.dupe(u8, grant.client_id);
             errdefer allocator.free(client_id);
+
             // A disconnected browser must not discard a valid grant, but the
             // authorization deadline must still be able to cancel this task.
             try respond(&request, &writer, .ok, "Authorization received. Return to the terminal to check login status.");
@@ -94,14 +99,16 @@ fn respond(request: *std.http.Server.Request, writer: *std.Io.net.Stream.Writer,
     };
 }
 
-fn parse(allocator: std.mem.Allocator, method: std.http.Method, target: []const u8, expected_state: []const u8) !Grant {
+fn parse(allocator: std.mem.Allocator, method: std.http.Method, target: []const u8, expected_state: []const u8, expected_client: ?[]const u8) !Grant {
     const query_start = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
     if (!std.mem.eql(u8, target[0..query_start], "/auth/callback")) return error.NotFound;
     if (method != .GET) return error.MethodNotAllowed;
     if (query_start == target.len or std.mem.indexOfScalar(u8, target, '#') != null) return error.InvalidQuery;
+
     var fields: [4]?[]const u8 = .{ null, null, null, null };
     const names = [_][]const u8{ "state", "code", "client_id", "error" };
     var pairs = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+
     while (pairs.next()) |pair| {
         const equals = std.mem.indexOfScalar(u8, pair, '=') orelse return error.InvalidQuery;
         const name = try decode(allocator, pair[0..equals]);
@@ -116,7 +123,17 @@ fn parse(allocator: std.mem.Allocator, method: std.http.Method, target: []const 
     const state = fields[0] orelse return error.InvalidState;
     if (!std.mem.eql(u8, state, expected_state)) return error.InvalidState;
     if (fields[3] != null) return error.AuthorizationDenied;
-    return .{ .code = fields[1] orelse return error.InvalidQuery, .client_id = fields[2] orelse return error.InvalidQuery };
+
+    const client_id = if (expected_client) |selected| blk: {
+        if (fields[2]) |supplied| {
+            if (!std.mem.eql(u8, supplied, selected)) return error.ClientMismatch;
+        }
+        break :blk selected;
+    } else fields[2] orelse return error.InvalidQuery;
+
+    if (std.mem.eql(u8, client_id, "dynamic_agent_client")) return error.InvalidQuery;
+
+    return .{ .code = fields[1] orelse return error.InvalidQuery, .client_id = client_id };
 }
 
 fn decode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -144,7 +161,7 @@ fn decode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 test "form decoding preserves code bytes and issued client" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const grant = try parse(arena.allocator(), .GET, "/auth/callback?state=s%2B+x&code=a%2Bb%2Fc%3D+z&client_id=issued%26id", "s+ x");
+    const grant = try parse(arena.allocator(), .GET, "/auth/callback?state=s%2B+x&code=a%2Bb%2Fc%3D+z&client_id=issued%26id", "s+ x", null);
     try std.testing.expectEqualStrings("a+b/c= z", grant.code);
     try std.testing.expectEqualStrings("issued&id", grant.client_id);
 }
@@ -153,8 +170,8 @@ test "state, required client, duplicates, malformed queries and fragments are re
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?state=wrong&code=c&client_id=i", "s"));
-    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?code=c&client_id=i", "s"));
+    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?state=wrong&code=c&client_id=i", "s", null));
+    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?code=c&client_id=i", "s", null));
     const invalid = [_][]const u8{
         "state=s&code=c",                     "state=s&code=c&client_id=",           "state=s&code=c&client_id=i&client_id=j",
         "state=s&state=s&code=c&client_id=i", "state=s&code=c&code=c&client_id=i",   "state=s&code=%GG&client_id=i",
@@ -163,20 +180,31 @@ test "state, required client, duplicates, malformed queries and fragments are re
     };
     for (invalid) |query| {
         const target = try std.fmt.allocPrint(a, "/auth/callback?{s}", .{query});
-        try std.testing.expectError(error.InvalidQuery, parse(a, .GET, target, "s"));
+        try std.testing.expectError(error.InvalidQuery, parse(a, .GET, target, "s", null));
     }
-    try std.testing.expectError(error.NotFound, parse(a, .GET, "/favicon.ico", "s"));
-    try std.testing.expectError(error.MethodNotAllowed, parse(a, .POST, "/auth/callback?state=s", "s"));
+    try std.testing.expectError(error.NotFound, parse(a, .GET, "/favicon.ico", "s", null));
+    try std.testing.expectError(error.MethodNotAllowed, parse(a, .POST, "/auth/callback?state=s", "s", null));
+}
+
+test "returning callbacks retain the pending client and reject replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const grant = try parse(a, .GET, "/auth/callback?state=s&code=c", "s", "issued");
+    try std.testing.expectEqualStrings("issued", grant.client_id);
+    _ = try parse(a, .GET, "/auth/callback?state=s&code=c&client_id=issued", "s", "issued");
+    try std.testing.expectError(error.ClientMismatch, parse(a, .GET, "/auth/callback?state=s&code=c&client_id=other", "s", "issued"));
+    try std.testing.expectError(error.InvalidQuery, parse(a, .GET, "/auth/callback?state=s&code=c&client_id=dynamic_agent_client", "s", null));
 }
 
 test "OAuth errors require matching state" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectError(error.AuthorizationDenied, parse(a, .GET, "/auth/callback?state=s&error=access_denied", "s"));
-    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?state=other&error=access_denied", "s"));
-    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?error=access_denied", "s"));
-    try std.testing.expectError(error.InvalidQuery, parse(a, .GET, "/auth/callback?state=s&error=a&error=b", "s"));
+    try std.testing.expectError(error.AuthorizationDenied, parse(a, .GET, "/auth/callback?state=s&error=access_denied", "s", null));
+    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?state=other&error=access_denied", "s", null));
+    try std.testing.expectError(error.InvalidState, parse(a, .GET, "/auth/callback?error=access_denied", "s", null));
+    try std.testing.expectError(error.InvalidQuery, parse(a, .GET, "/auth/callback?state=s&error=a&error=b", "s", null));
 }
 
 test "public listener API compiles and reports assigned loopback port" {

@@ -9,7 +9,8 @@ pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| {
         if (err == error.InvalidArguments) std.log.err("{s}", .{cli.usage});
         std.log.err("event=command_failed error={s}", .{@errorName(err)});
-        if (err == error.ReauthenticationRequired) std.log.err("Run fumo-gateway auth login codex with the same credentials directory to authenticate again.", .{});
+        if (err == error.ReauthenticationRequired or err == error.CodeExchangeInvalidGrant) std.log.err("Run fumo-gateway auth login codex with the same credentials directory to reauthorize the saved registration.", .{});
+        if (err == error.InvalidClient) std.log.err("SIWC renewal stopped: check the saved client configuration before reauthorizing.", .{});
         return 1;
     };
     return 0;
