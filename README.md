@@ -25,6 +25,14 @@ For remote administration, use an SSH tunnel; do not expose admin access over pl
 
 Point your client at `http://127.0.0.1:8080/v1` with `FUMO_PI_KEY` as its bearer key.
 
+## Nix
+
+```sh
+nix run github:sleroq/fumo-gateway
+```
+
+For NixOS, use the [included module](nix/README.md).
+
 ## Development
 
 Run `zig build test`, `zig build test-auth`, and `zig build test-service`.
