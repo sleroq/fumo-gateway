@@ -19,9 +19,65 @@ pub const Model = struct {
     name: ?[]const u8 = null,
     id: []const u8,
     object: []const u8 = "model",
-    created: i64 = 0,
+    created: ?i64 = null,
     owned_by: []const u8,
+    /// Native discovery extensions, emitted at the catalog entry's top level.
+    metadata: std.json.ObjectMap = .empty,
+
+    pub fn jsonStringify(self: Model, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("id");
+        try writer.write(self.id);
+        try writer.objectField("object");
+        try writer.write(self.object);
+        try writer.objectField("owned_by");
+        try writer.write(self.owned_by);
+        if (self.name) |name| {
+            try writer.objectField("name");
+            try writer.write(name);
+        }
+        if (self.created) |created| {
+            try writer.objectField("created");
+            try writer.write(created);
+        }
+        var fields = self.metadata.iterator();
+        while (fields.next()) |field| {
+            try writer.objectField(field.key_ptr.*);
+            try writer.write(field.value_ptr.*);
+        }
+        try writer.endObject();
+    }
+
+    fn copy(self: Model, allocator: std.mem.Allocator) !Model {
+        var result = self;
+        result.id = try allocator.dupe(u8, self.id);
+        result.name = if (self.name) |name| try allocator.dupe(u8, name) else null;
+        result.object = try allocator.dupe(u8, self.object);
+        result.owned_by = try allocator.dupe(u8, self.owned_by);
+        result.metadata = (try copyValue(allocator, .{ .object = self.metadata })).object;
+        return result;
+    }
 };
+
+fn copyValue(allocator: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try allocator.dupe(u8, text) },
+        .number_string => |text| .{ .number_string = try allocator.dupe(u8, text) },
+        .array => |array| blk: {
+            var result = std.json.Array.init(allocator);
+            for (array.items) |item| try result.append(try copyValue(allocator, item));
+            break :blk .{ .array = result };
+        },
+        .object => |object| blk: {
+            var result: std.json.ObjectMap = .empty;
+            var fields = object.iterator();
+            while (fields.next()) |field|
+                try result.put(allocator, try allocator.dupe(u8, field.key_ptr.*), try copyValue(allocator, field.value_ptr.*));
+            break :blk .{ .object = result };
+        },
+        else => value,
+    };
+}
 
 /// Service-owned snapshot. Keep at a stable address and join discovery callers
 /// before deinit. The mutex protects refresh and copying, not inference.
@@ -72,13 +128,7 @@ pub const Cache = struct {
         }
         if (self.arena == null) return false;
         for (self.models) |model| {
-            try output.append(request_allocator, .{
-                .id = try request_allocator.dupe(u8, model.id),
-                .name = if (model.name) |name| try request_allocator.dupe(u8, name) else null,
-                .object = try request_allocator.dupe(u8, model.object),
-                .created = model.created,
-                .owned_by = try request_allocator.dupe(u8, model.owned_by),
-            });
+            try output.append(request_allocator, try model.copy(request_allocator));
         }
         return true;
     }
@@ -130,29 +180,33 @@ pub const Cache = struct {
             }
             return err;
         };
-        const Entry = struct { id: []const u8, created: i64 = 0, name: ?[]const u8 = null };
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .parse_numbers = false };
         const entries = switch (source.format) {
-            .openai => (try std.json.parseFromSliceLeaky(struct { data: []Entry }, allocator, body, .{ .ignore_unknown_fields = true })).data,
-            .siwc => blk: {
-                const SiwcEntry = struct { slug: []const u8, display_name: []const u8, visibility: []const u8 };
-                const parsed = try std.json.parseFromSliceLeaky(struct { models: []SiwcEntry }, allocator, body, .{ .ignore_unknown_fields = true });
-                var listed: std.ArrayList(Entry) = .empty;
-                for (parsed.models) |entry| {
-                    if (std.mem.eql(u8, entry.visibility, "list"))
-                        try listed.append(allocator, .{ .id = entry.slug, .name = entry.display_name });
-                }
-                break :blk listed.items;
-            },
+            .openai => (try std.json.parseFromSliceLeaky(struct { data: []std.json.Value }, allocator, body, options)).data,
+            .siwc => (try std.json.parseFromSliceLeaky(struct { models: []std.json.Value }, allocator, body, options)).models,
         };
         var result: std.ArrayList(Model) = .empty;
         const owner = try allocator.dupe(u8, source.namespace);
-        for (entries) |entry| {
+        for (entries) |value| {
+            const Entry = struct { id: []const u8, created: ?i64 = null, name: ?[]const u8 = null };
+            const entry: Entry = switch (source.format) {
+                .openai => try std.json.parseFromValueLeaky(Entry, allocator, value, options),
+                .siwc => blk: {
+                    const SiwcEntry = struct { slug: []const u8, display_name: []const u8, visibility: []const u8, created: ?i64 = null };
+                    const siwc = try std.json.parseFromValueLeaky(SiwcEntry, allocator, value, options);
+                    if (!std.mem.eql(u8, siwc.visibility, "list")) continue;
+                    break :blk .{ .id = siwc.slug, .name = siwc.display_name, .created = siwc.created };
+                },
+            };
             if (entry.id.len == 0) return error.EmptyModelId;
+            var metadata = value.object;
+            for ([_][]const u8{ "id", "object", "owned_by", "name", "created" }) |field| _ = metadata.orderedRemove(field);
             try result.append(allocator, .{
                 .id = try allocator.print("{s}/{s}", .{ source.namespace, entry.id }),
                 .created = entry.created,
                 .name = entry.name,
                 .owned_by = owner,
+                .metadata = metadata,
             });
         }
         return result.items;
@@ -175,7 +229,9 @@ const Fixture = @import("fixture").Fixture;
 test "models fetch authorization nested IDs TTL refresh and stale snapshot" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const first = "{\"data\":[{\"id\":\"org/model\",\"created\":12,\"extra\":true}]}";
+    const first =
+        \\{"data":[{"id":"org/model","name":"Upstream label","created":12,"object":"upstream-model","owned_by":"upstream-owner","context_length":200000,"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"top_provider":{"max_completion_tokens":32000},"supported_parameters":["reasoning","tools"],"extra":{"enabled":false,"nullable":null,"price":0.1234567890123456789,"precise":18446744073709551617},"metadata":{"native":true}}]}
+    ;
     const second = "{\"data\":[{\"id\":\"replacement\"}]}";
     const first_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ first.len, first });
     const second_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ second.len, second });
@@ -195,7 +251,7 @@ test "models fetch authorization nested IDs TTL refresh and stale snapshot" {
     try fixture.waitRequest();
     try std.testing.expectEqual(@as(usize, 1), output.items.len);
     try std.testing.expectEqualStrings("provider/org/model", output.items[0].id);
-    try std.testing.expectEqual(@as(i64, 12), output.items[0].created);
+    try std.testing.expectEqual(@as(?i64, 12), output.items[0].created);
     try std.testing.expect(std.mem.containsAtLeast(u8, fixture.requests[0].?, 1, "GET /prefix/models "));
     try std.testing.expect(std.mem.containsAtLeast(u8, fixture.requests[0].?, 1, "Bearer secret"));
     var cached: std.ArrayList(Model) = .empty;
@@ -206,10 +262,28 @@ test "models fetch authorization nested IDs TTL refresh and stale snapshot" {
     _ = try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .format = .openai }, &cached);
     try std.testing.expectEqualStrings("provider/replacement", cached.items[0].id);
     try std.testing.expectEqualStrings("provider/org/model", output.items[0].id);
+    // Refresh freed the original cache arena. Nested fields in both prior
+    // request-owned copies must still serialize without losing numeric precision.
+    const serialized = try std.json.Stringify.valueAlloc(ra, output.items[0], .{});
+    const copied = try std.json.parseFromSliceLeaky(std.json.Value, ra, serialized, .{});
+    try std.testing.expectEqualStrings("model", copied.object.get("object").?.string);
+    try std.testing.expectEqualStrings("provider", copied.object.get("owned_by").?.string);
+    try std.testing.expectEqualStrings("Upstream label", copied.object.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, 200000), copied.object.get("context_length").?.integer);
+    try std.testing.expectEqualStrings("image", copied.object.get("architecture").?.object.get("input_modalities").?.array.items[1].string);
+    try std.testing.expectEqual(@as(i64, 32000), copied.object.get("top_provider").?.object.get("max_completion_tokens").?.integer);
+    try std.testing.expectEqualStrings("reasoning", copied.object.get("supported_parameters").?.array.items[0].string);
+    try std.testing.expect(!copied.object.get("extra").?.object.get("enabled").?.bool);
+    try std.testing.expectEqual(.null, copied.object.get("extra").?.object.get("nullable").?);
+    try std.testing.expect(copied.object.get("metadata").?.object.get("native").?.bool);
+    try std.testing.expect(std.mem.find(u8, serialized, "0.1234567890123456789") != null);
+    try std.testing.expect(std.mem.find(u8, serialized, "18446744073709551617") != null);
     cache.next_refresh = 0;
     cached.clearRetainingCapacity();
     try std.testing.expect(try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .format = .openai }, &cached));
     try std.testing.expectEqualStrings("provider/replacement", cached.items[0].id);
+    const sparse = try std.json.Stringify.valueAlloc(ra, cached.items[0], .{});
+    try std.testing.expectEqualStrings("{\"id\":\"provider/replacement\",\"object\":\"model\",\"owned_by\":\"provider\"}", sparse);
 }
 
 test "models malformed response is not cached and timeout joins socket task" {
@@ -238,7 +312,9 @@ test "models malformed response is not cached and timeout joins socket task" {
 test "models SIWC lists visible slugs and labels in server order" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const body = "{\"models\":[{\"slug\":\"z/model\",\"display_name\":\"First model\",\"visibility\":\"list\"},{\"slug\":\"hidden\",\"display_name\":\"Hidden\",\"visibility\":\"hidden\"},{\"slug\":\"alpha\",\"display_name\":\"Second\",\"visibility\":\"list\"}]}";
+    const body =
+        \\{"models":[{"slug":"z/model","display_name":"First model","visibility":"list","context_window":272000,"max_output_tokens":16000,"input_modalities":["text","image"],"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high","description":"Thorough"}],"supports_parallel_tool_calls":false},{"slug":"hidden","display_name":"Hidden","visibility":"hidden","context_window":1},{"slug":"alpha","display_name":"Second","visibility":"list"}]}
+    ;
     const reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
     var fixture = try Fixture.init(a, io, &.{.{ .bytes = reply }});
     defer fixture.deinit();
@@ -259,6 +335,21 @@ test "models SIWC lists visible slugs and labels in server order" {
     cache.deinit();
     cache.arena = null;
     try std.testing.expectEqualStrings("First model", output.items[0].name.?);
+    const serialized = try std.json.Stringify.valueAlloc(ra, output.items, .{});
+    const copied = try std.json.parseFromSliceLeaky(std.json.Value, ra, serialized, .{});
+    const rich = copied.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 272000), rich.get("context_window").?.integer);
+    try std.testing.expectEqual(@as(i64, 16000), rich.get("max_output_tokens").?.integer);
+    try std.testing.expectEqualStrings("image", rich.get("input_modalities").?.array.items[1].string);
+    try std.testing.expectEqualStrings("medium", rich.get("default_reasoning_level").?.string);
+    const reasoning = rich.get("supported_reasoning_levels").?.array.items;
+    try std.testing.expectEqualStrings("low", reasoning[0].object.get("effort").?.string);
+    try std.testing.expectEqualStrings("Thorough", reasoning[1].object.get("description").?.string);
+    try std.testing.expect(!rich.get("supports_parallel_tool_calls").?.bool);
+    try std.testing.expect(!rich.contains("created"));
+    const sparse = copied.array.items[1].object;
+    for ([_][]const u8{ "context_window", "max_output_tokens", "input_modalities", "default_reasoning_level", "supported_reasoning_levels", "supports_parallel_tool_calls", "created" }) |field|
+        try std.testing.expect(!sparse.contains(field));
 }
 
 const Caller = struct {

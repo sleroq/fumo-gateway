@@ -811,7 +811,7 @@ test "transport oversized request is rejected before reading or inviting body" {
 test "transport models aggregate namespaces aliases and cached metadata while inference bypasses discovery" {
     const T = TransportTest;
     const a = T.allocator;
-    const catalog = "{\"object\":\"list\",\"data\":[{\"id\":\"shared\",\"created\":42},{\"id\":\"vendor/new-model\"}]}";
+    const catalog = "{\"object\":\"list\",\"data\":[{\"id\":\"shared\",\"created\":42,\"limits\":{\"context\":200000,\"output\":32000},\"input_modalities\":[\"text\",\"image\"],\"reasoning\":{\"efforts\":[\"low\",\"high\"]}},{\"id\":\"vendor/new-model\"}]}";
     const catalog_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ catalog.len, catalog });
     var responses_fixture = try T.fixture.Fixture.init(a, T.io, &.{
         .{ .bytes = catalog_reply },
@@ -861,6 +861,13 @@ test "transport models aggregate namespaces aliases and cached metadata while in
         try std.testing.expectEqualStrings("chat/shared", data[2].object.get("id").?.string);
         for (data) |model| try std.testing.expect(!model.object.contains("api"));
         try std.testing.expectEqual(@as(i64, 42), data[2].object.get("created").?.integer);
+        try std.testing.expectEqual(@as(i64, 200000), data[2].object.get("limits").?.object.get("context").?.integer);
+        try std.testing.expectEqualStrings("image", data[2].object.get("input_modalities").?.array.items[1].string);
+        try std.testing.expectEqualStrings("high", data[2].object.get("reasoning").?.object.get("efforts").?.array.items[1].string);
+        // The shadowing alias points at an undiscovered target, not shared.
+        try std.testing.expect(!data[0].object.contains("limits"));
+        try std.testing.expect(!data[0].object.contains("created"));
+        try std.testing.expect(!data[1].object.contains("input_modalities"));
         try std.testing.expect(std.mem.find(u8, raw, "secret") == null);
         try std.testing.expectEqual(1, responses_fixture.count.load(.acquire));
         try std.testing.expectEqual(1, chat_fixture.count.load(.acquire));

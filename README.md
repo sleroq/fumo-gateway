@@ -29,6 +29,56 @@ Discover available model IDs:
 curl -H "Authorization: Bearer $FUMO_PI_KEY" http://127.0.0.1:8080/v1/models
 ```
 
+## Model catalog schema
+
+`GET /v1/models` returns `{"object":"list","data":[...]}`. Each catalog entry has:
+
+| Field | Schema | Source |
+| --- | --- | --- |
+| `id` | string, required | `<upstream>/<native-id>` or `<upstream>/<alias>` |
+| `object` | `"model"`, required | Gateway envelope |
+| `owned_by` | string, required | Configured upstream namespace, not the upstream's owner field |
+| `name` | string, optional | Upstream `name`, or SIWC `display_name` |
+| `created` | integer, optional | Upstream timestamp, only when supplied and non-null |
+| Other fields | any JSON value, optional | Native discovery fields, with their original names and nested structure |
+
+For example, if SIWC discovery supplies these capabilities, an entry can contain:
+
+```json
+{
+  "id": "codex/example-model",
+  "object": "model",
+  "owned_by": "codex",
+  "name": "Example model",
+  "slug": "example-model",
+  "display_name": "Example model",
+  "visibility": "list",
+  "context_window": 272000,
+  "input_modalities": ["text", "image"],
+  "default_reasoning_level": "medium",
+  "supported_reasoning_levels": [
+    {"effort": "low", "description": "Fast"},
+    {"effort": "high", "description": "Thorough"}
+  ]
+}
+```
+
+Standard OpenAI-compatible catalogs retain their native extensions too, such as
+`context_length`, `architecture.input_modalities`, `top_provider.max_completion_tokens`,
+`limits`, or `supported_parameters` **when returned by discovery**. These are
+upstream-specific fields, not a universal capability schema: clients must check
+presence and understand that upstream's field semantics. Unknown extensions are
+preserved, including nested objects/arrays and explicit `false`, `0`, or `null`.
+Missing metadata stays absent; the gateway does not infer capabilities, assign
+protocols, populate model-family defaults, or consult a hard-coded model catalog.
+A minimal entry is just `{"id":"zen/example","object":"model","owned_by":"zen"}`.
+
+SIWC discovery still lists only entries with `visibility: "list"`, in server order.
+Aliases appear first and inherit the discovered native target's name, timestamp,
+and extensions; only `id` changes. If the target is unavailable, the alias has only
+the gateway envelope. An alias shadowing another discovered ID never inherits
+that shadowed model's metadata. Alias routing remains a single lookup, unchanged.
+
 ## Development
 
 Build: `zig build`. Test: `zig build test` (local fixtures, no provider credentials).

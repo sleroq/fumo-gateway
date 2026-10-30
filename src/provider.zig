@@ -120,21 +120,29 @@ pub const Provider = struct {
 
     fn appendModels(self: *Provider, client: *std.http.Client, arena_allocator: std.mem.Allocator, list: *std.ArrayList(models.Model)) !bool {
         const upstream = self.upstream;
-        // Aliases remain usable even if a provider has no discovery endpoint.
-        for (upstream.aliases.map.keys()) |alias| {
-            try list.append(arena_allocator, .{
-                .id = try arena_allocator.print("{s}/{s}", .{ upstream.name, alias }),
-                .owned_by = upstream.name,
-            });
-        }
-
+        var discovered_models: std.ArrayList(models.Model) = .empty;
         const discovered = try self.catalog.append(client, arena_allocator, .{
             .url = try arena_allocator.print("{s}/models", .{upstream.base_url}),
             .authorization = self.authorization(arena_allocator),
             .headers = upstream.requiredHeaders(),
             .namespace = upstream.name,
             .format = if (upstream.auth == .codex) .siwc else .openai,
-        }, list);
+        }, &discovered_models);
+
+        // Aliases inherit only their native target's metadata, never a shadowed
+        // model's. They remain usable even without a discovery endpoint.
+        for (upstream.aliases.map.keys(), upstream.aliases.map.values()) |alias, target| {
+            var model: models.Model = .{ .id = undefined, .owned_by = upstream.name };
+            for (discovered_models.items) |native| {
+                if (std.mem.eql(u8, native.id[upstream.name.len + 1 ..], target)) {
+                    model = native;
+                    break;
+                }
+            }
+            model.id = try arena_allocator.print("{s}/{s}", .{ upstream.name, alias });
+            try list.append(arena_allocator, model);
+        }
+        try list.appendSlice(arena_allocator, discovered_models.items);
 
         return discovered or upstream.aliases.map.count() != 0;
     }
@@ -237,6 +245,52 @@ fn validateRequestDepth(allocator: std.mem.Allocator, body: []const u8) !void {
         if (scanner.stackHeight() > max_request_depth) return error.InvalidRequest;
         if (token == .end_of_document) return;
     }
+}
+
+test "provider catalog aliases inherit only discovered target metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const body =
+        \\{"data":[{"id":"vendor/native","name":"Target","created":23,"context_length":128000,"architecture":{"input_modalities":["text","image"]},"reasoning":{"efforts":["low","high"]}},{"id":"shared","name":"Shadowed","context_length":1000},{"id":"self","max_output_tokens":42}]}
+    ;
+    const Fixture = @import("fixture").Fixture;
+    var fixture = try Fixture.init(a, io, &.{.{ .bytes = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) }});
+    defer fixture.deinit();
+    try fixture.start();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    var upstream: Upstream = .{ .name = "test", .base_url = try fixture.origin(ra) };
+    try upstream.aliases.map.put(ra, "shared", "vendor/native");
+    try upstream.aliases.map.put(ra, "fallback", "unlisted");
+    try upstream.aliases.map.put(ra, "self", "self");
+    try upstream.aliases.map.put(ra, "chain", "shared");
+    var registry = try Registry.init(a, io, &.{upstream});
+    defer registry.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+
+    for (0..2) |_| {
+        const catalog = try registry.modelList(&client, ra);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ra, catalog, .{});
+        const data = parsed.object.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 5), data.len);
+        const alias = data[0].object;
+        try std.testing.expectEqualStrings("test/shared", alias.get("id").?.string);
+        try std.testing.expectEqualStrings("Target", alias.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 23), alias.get("created").?.integer);
+        try std.testing.expectEqual(@as(i64, 128000), alias.get("context_length").?.integer);
+        try std.testing.expectEqualStrings("image", alias.get("architecture").?.object.get("input_modalities").?.array.items[1].string);
+        try std.testing.expectEqualStrings("high", alias.get("reasoning").?.object.get("efforts").?.array.items[1].string);
+        try std.testing.expectEqualStrings("test/fallback", data[1].object.get("id").?.string);
+        try std.testing.expectEqual(@as(usize, 3), data[1].object.count());
+        try std.testing.expectEqual(@as(i64, 42), data[2].object.get("max_output_tokens").?.integer);
+        // Routing performs one alias lookup, not recursive alias expansion.
+        try std.testing.expectEqualStrings("Shadowed", data[3].object.get("name").?.string);
+        try std.testing.expectEqual(@as(i64, 1000), data[3].object.get("context_length").?.integer);
+        try std.testing.expectEqualStrings("test/vendor/native", data[4].object.get("id").?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
 }
 
 test "provider Responses header allowlist excludes credentials and transport-owned headers" {
