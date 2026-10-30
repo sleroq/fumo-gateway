@@ -18,6 +18,30 @@
         system:
         let
           pkgs = pkgsFor system;
+          webDependencies = pkgs.stdenvNoCC.mkDerivation {
+            pname = "fumo-gateway-web-dependencies";
+            version = "0.0.0";
+            src = nixpkgs.lib.fileset.toSource {
+              root = ./web;
+              fileset = nixpkgs.lib.fileset.unions [
+                ./web/package.json
+                ./web/bun.lock
+              ];
+            };
+            nativeBuildInputs = [ pkgs.bun ];
+            dontConfigure = true;
+            dontFixup = true;
+            buildPhase = ''
+              export HOME="$TMPDIR"
+              bun install --frozen-lockfile --ignore-scripts --os='*' --cpu='*'
+            '';
+            installPhase = ''
+              cp -R node_modules "$out"
+            '';
+            outputHashMode = "recursive";
+            outputHashAlgo = "sha256";
+            outputHash = "sha256-fM3lkEjidsJjSMRK3um3nLEmKrjclIPploPbLCzlmic=";
+          };
           package = pkgs.stdenvNoCC.mkDerivation {
             pname = "fumo-gateway";
             version = "0.0.0";
@@ -28,9 +52,25 @@
                 ./build.zig.zon
                 ./src
                 ./tests
+                ./assets
+                (nixpkgs.lib.fileset.difference ./web (
+                  nixpkgs.lib.fileset.unions [
+                    (nixpkgs.lib.fileset.maybeMissing ./web/node_modules)
+                    (nixpkgs.lib.fileset.maybeMissing ./web/dist)
+                  ]
+                ))
               ];
             };
-            nativeBuildInputs = [ pkgs.zig_0_17.hook ];
+            nativeBuildInputs = [
+              pkgs.zig_0_17.hook
+              pkgs.bun
+            ];
+            preConfigure = ''
+              cp -R ${webDependencies} web/node_modules
+              chmod -R u+w web/node_modules
+              substituteInPlace web/node_modules/typescript/bin/tsc web/node_modules/vite/bin/vite.js \
+                --replace-fail '#!/usr/bin/env node' '#!${pkgs.bun}/bin/bun'
+            '';
             doCheck = true;
             __darwinAllowLocalNetworking = true;
             meta = {
@@ -48,7 +88,10 @@
 
       devShells = forAllSystems (system: {
         default = (pkgsFor system).mkShell {
-          packages = [ (pkgsFor system).zig_0_17 ];
+          packages = [
+            (pkgsFor system).zig_0_17
+            (pkgsFor system).bun
+          ];
         };
       });
 

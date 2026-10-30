@@ -7,79 +7,28 @@ Forwards native OpenAI Responses and Chat Completions requests; no protocol tran
 
 ## Quick start
 
-Requires Zig **0.17.0** (`nix develop`). Copy
-[`gateway.example.json`](gateway.example.json) to `gateway.json`, remove unused
-upstreams, and set API keys for those you keep.
+Requires Zig **0.17.0** and **Bun** (`nix develop`). Copy
+[`gateway.example.json`](gateway.example.json), remove unused upstreams, and set
+the provider API keys referenced by your configuration.
 
 ```sh
+bun install --cwd web --frozen-lockfile
 cp gateway.example.json gateway.json
 export FUMO_PI_KEY="$(openssl rand -hex 32)"
-zig build run -- auth login codex # Only needed for Codex.
-zig build run -- --config gateway.json
+export FUMO_ADMIN_KEY="$(openssl rand -hex 32)"
+zig build
+zig-out/bin/fumo-gateway --config gateway.json
 ```
+
+For ChatGPT, open **http://127.0.0.1:8080/admin/**, unlock with `FUMO_ADMIN_KEY`.
+For remote administration, use an SSH tunnel; do not expose admin access over plaintext HTTP.
 
 Point your client at `http://127.0.0.1:8080/v1` with `FUMO_PI_KEY` as its bearer key.
-Use `upstream/model-id` as the model; optional aliases live in each upstream's
-`aliases` map. Choose the model's native API: `/responses` or `/chat/completions`.
-Codex supports Responses only.
-
-Discover available model IDs:
-
-```sh
-curl -H "Authorization: Bearer $FUMO_PI_KEY" http://127.0.0.1:8080/v1/models
-```
-
-## Model catalog schema
-
-`GET /v1/models` returns `{"object":"list","data":[...]}`. Each catalog entry has:
-
-| Field | Schema | Source |
-| --- | --- | --- |
-| `id` | string, required | `<upstream>/<native-id>` or `<upstream>/<alias>` |
-| `object` | `"model"`, required | Gateway envelope |
-| `owned_by` | string, required | Configured upstream namespace, not the upstream's owner field |
-| `name` | string, optional | Upstream `name`, or SIWC `display_name` |
-| `created` | integer, optional | Upstream timestamp, only when supplied and non-null |
-| Other fields | any JSON value, optional | Native discovery fields, with their original names and nested structure |
-
-For example, if SIWC discovery supplies these capabilities, an entry can contain:
-
-```json
-{
-  "id": "codex/example-model",
-  "object": "model",
-  "owned_by": "codex",
-  "name": "Example model",
-  "slug": "example-model",
-  "display_name": "Example model",
-  "visibility": "list",
-  "context_window": 272000,
-  "input_modalities": ["text", "image"],
-  "default_reasoning_level": "medium",
-  "supported_reasoning_levels": [
-    {"effort": "low", "description": "Fast"},
-    {"effort": "high", "description": "Thorough"}
-  ]
-}
-```
-
-Standard OpenAI-compatible catalogs retain their native extensions too, such as
-`context_length`, `architecture.input_modalities`, `top_provider.max_completion_tokens`,
-`limits`, or `supported_parameters` **when returned by discovery**. These are
-upstream-specific fields, not a universal capability schema: clients must check
-presence and understand that upstream's field semantics. Unknown extensions are
-preserved, including nested objects/arrays and explicit `false`, `0`, or `null`.
-Missing metadata stays absent; the gateway does not infer capabilities, assign
-protocols, populate model-family defaults, or consult a hard-coded model catalog.
-A minimal entry is just `{"id":"zen/example","object":"model","owned_by":"zen"}`.
-
-SIWC discovery still lists only entries with `visibility: "list"`, in server order.
-Aliases appear first and inherit the discovered native target's name, timestamp,
-and extensions; only `id` changes. If the target is unavailable, the alias has only
-the gateway envelope. An alias shadowing another discovered ID never inherits
-that shadowed model's metadata. Alias routing remains a single lookup, unchanged.
 
 ## Development
 
-Build: `zig build`. Test: `zig build test` (local fixtures, no provider credentials).
+Run `zig build test`, `zig build test-auth`, and `zig build test-service`.
+Frontend checks: `bun run --cwd web lint`, `typecheck`, and `test` (each as a separate script).
+For frontend development, run the gateway and `bun run --cwd web dev`.
+
 Planned work: [ROADMAP.md](ROADMAP.md).

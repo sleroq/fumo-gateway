@@ -420,7 +420,7 @@ test "transport SIWC fixture preserves native fields, client Accept, and stream 
     const url = try a.print("{s}/v1", .{origin});
     defer a.free(url);
     // Exercise preparation against loopback, without adding a production
-    // endpoint override. Provider.init separately proves pinning is mandatory.
+    // endpoint override. Registry.init separately proves pinning is mandatory.
     var upstream: Upstream = .{ .name = "test", .base_url = url, .auth = .{ .codex = "/unused" } };
     defer upstream.aliases.deinit(a);
     try upstream.aliases.map.put(a, "demo", "fixture-model");

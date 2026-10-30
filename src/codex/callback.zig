@@ -2,127 +2,7 @@ const std = @import("std");
 
 pub const Grant = struct { code: []const u8, client_id: []const u8 };
 
-pub const Callback = struct {
-    server: std.Io.net.Server,
-
-    pub fn listen(io: std.Io, port: u16) !Callback {
-        const posix = std.posix;
-        const handle: posix.fd_t = @intCast(try socketResult(posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP)));
-        var server: std.Io.net.Server = .{
-            .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(port) } },
-            .options = {},
-        };
-        errdefer server.deinit(io);
-        _ = try socketResult(posix.system.fcntl(handle, posix.F.SETFD, @as(u32, posix.FD_CLOEXEC)));
-
-        // std.Io's reuse_address also enables REUSEPORT. On Linux disabling it
-        // after listen leaves the socket in its reuse-port group. Set only
-        // REUSEADDR before bind so retries work without sharing an active port.
-        const enabled: c_int = 1;
-        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enabled));
-        var address: posix.sockaddr.in = .{
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
-        };
-        _ = try socketResult(posix.system.bind(handle, @ptrCast(&address), @sizeOf(@TypeOf(address))));
-        _ = try socketResult(posix.system.listen(handle, std.Io.net.default_kernel_backlog));
-        var address_len: posix.socklen_t = @sizeOf(@TypeOf(address));
-        _ = try socketResult(posix.system.getsockname(handle, @ptrCast(&address), &address_len));
-        server.socket.address.setPort(std.mem.bigToNative(u16, address.port));
-        return .{ .server = server };
-    }
-
-    pub fn deinit(self: *Callback, io: std.Io) void {
-        self.server.deinit(io);
-    }
-
-    pub fn redirectUri(self: *const Callback, allocator: std.mem.Allocator) ![]u8 {
-        return allocator.print("http://127.0.0.1:{d}/auth/callback", .{self.server.socket.address.getPort()});
-    }
-
-    /// The caller owns the deadline and must deinit the listener after waiting.
-    /// Only the returned grant is allocated in the caller's allocator.
-    pub fn wait(self: *Callback, allocator: std.mem.Allocator, io: std.Io, expected_state: []const u8, expected_client: ?[]const u8) !Grant {
-        while (true) {
-            const stream = try self.server.accept(io);
-            defer stream.close(io);
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-
-            var read_buffer: [16384]u8 = undefined;
-            var write_buffer: [1024]u8 = undefined;
-            var reader = stream.reader(io, &read_buffer);
-            var writer = stream.writer(io, &write_buffer);
-            var server = std.http.Server.init(&reader.interface, &writer.interface);
-
-            var request = server.receiveHead() catch {
-                if (reader.err) |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => {},
-                };
-                // Malformed or oversized HTTP heads also get a static response.
-                writer.interface.writeAll("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\n\r\n") catch {};
-                writer.interface.flush() catch {};
-                if (writer.err) |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => {},
-                };
-                try io.checkCancel();
-                continue;
-            };
-
-            const grant = parse(arena.allocator(), request.head.method, request.head.target, expected_state, expected_client) catch |err| {
-                const status: std.http.Status = switch (err) {
-                    error.NotFound => .not_found,
-                    error.MethodNotAllowed => .method_not_allowed,
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => .bad_request,
-                };
-                try respond(&request, &writer, status, "Invalid authorization callback.");
-                if (err == error.AuthorizationDenied) return error.AuthorizationDenied;
-                try io.checkCancel();
-                continue;
-            };
-
-            const code = try allocator.dupe(u8, grant.code);
-            errdefer allocator.free(code);
-            const client_id = try allocator.dupe(u8, grant.client_id);
-            errdefer allocator.free(client_id);
-
-            // A disconnected browser must not discard a valid grant, but the
-            // authorization deadline must still be able to cancel this task.
-            try respond(&request, &writer, .ok, "Authorization received. Return to the terminal to check login status.");
-            return .{ .code = code, .client_id = client_id };
-        }
-    }
-};
-
-fn socketResult(result: anytype) !@TypeOf(result) {
-    return switch (std.posix.errno(result)) {
-        .SUCCESS => result,
-        .ADDRINUSE => error.AddressInUse,
-        .ACCES => error.AccessDenied,
-        else => |err| std.posix.unexpectedErrno(err),
-    };
-}
-
-fn respond(request: *std.http.Server.Request, writer: *std.Io.net.Stream.Writer, status: std.http.Status, body: []const u8) std.Io.Cancelable!void {
-    request.respond(body, .{
-        .status = status,
-        .keep_alive = false,
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
-            .{ .name = "Cache-Control", .value = "no-store" },
-            .{ .name = "Referrer-Policy", .value = "no-referrer" },
-        },
-    }) catch {};
-    if (writer.err) |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => {},
-    };
-}
-
-fn parse(allocator: std.mem.Allocator, method: std.http.Method, target: []const u8, expected_state: []const u8, expected_client: ?[]const u8) !Grant {
+pub fn parse(allocator: std.mem.Allocator, method: std.http.Method, target: []const u8, expected_state: []const u8, expected_client: ?[]const u8) !Grant {
     const query_start = std.mem.findScalar(u8, target, '?') orelse target.len;
     if (!std.mem.eql(u8, target[0..query_start], "/auth/callback")) return error.NotFound;
     if (method != .GET) return error.MethodNotAllowed;
@@ -230,37 +110,20 @@ test "OAuth errors require matching state" {
     try std.testing.expectError(error.InvalidQuery, parse(a, .GET, "/auth/callback?state=s&error=a&error=b", "s", null));
 }
 
-test "public listener API compiles and reports assigned loopback port" {
-    const io = std.testing.io;
-    var callback = try Callback.listen(io, 0);
-    defer callback.deinit(io);
-    const uri = try callback.redirectUri(std.testing.allocator);
-    defer std.testing.allocator.free(uri);
-    try std.testing.expect(std.mem.startsWith(u8, uri, "http://127.0.0.1:"));
-    try std.testing.expect(callback.server.socket.address.getPort() != 0);
-    // Force analysis of the blocking path without starting an authorization flow.
-    _ = &Callback.wait;
+/// Parse a pasted callback locally; never follows or fetches the supplied URL.
+pub fn pasted(allocator: std.mem.Allocator, url: []const u8, state: []const u8, client: ?[]const u8) !Grant {
+    const prefix = "http://127.0.0.1:1455";
+    if (!std.mem.startsWith(u8, url, prefix)) return error.InvalidCallback;
+    return parse(allocator, .GET, url[prefix.len..], state, client);
 }
 
-test "callback port is exclusive while active and reusable after connection close" {
-    const io = std.testing.io;
-    var callback = try Callback.listen(io, 0);
-    const port = callback.server.socket.address.getPort();
-    {
-        defer callback.deinit(io);
-        try std.testing.expectError(error.AddressInUse, Callback.listen(io, port));
-        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-        const client = try address.connect(io, .{ .mode = .stream });
-        defer client.close(io);
-        const connection = try callback.server.accept(io);
-        connection.close(io);
-        // Observe the server's FIN before closing the client, leaving the
-        // server endpoint (rather than the client) in TIME_WAIT.
-        var buffer: [1]u8 = undefined;
-        var slices = [_][]u8{&buffer};
-        try std.testing.expectEqual(@as(usize, 0), (try client.readWithControl(io, &slices, &.{})).data_len);
-    }
-    var retry = try Callback.listen(io, port);
-    defer retry.deinit(io);
-    try std.testing.expectError(error.AddressInUse, Callback.listen(io, port));
+test "pasted callback validates origin and path without fetching" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const grant = try pasted(a, "http://127.0.0.1:1455/auth/callback?state=s&code=c&client_id=issued", "s", null);
+    try std.testing.expectEqualStrings("c", grant.code);
+    try std.testing.expectEqualStrings("issued", grant.client_id);
+    try std.testing.expectError(error.InvalidCallback, pasted(a, "https://example.com/auth/callback?state=s&code=c&client_id=issued", "s", null));
+    try std.testing.expectError(error.NotFound, pasted(a, "http://127.0.0.1:14550/auth/callback?state=s&code=c&client_id=issued", "s", null));
 }

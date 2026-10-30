@@ -1,5 +1,6 @@
 const std = @import("std");
 const auth = @import("auth.zig");
+const admin = @import("admin.zig");
 pub const Config = @import("config.zig").Config;
 const inference = @import("inference.zig");
 const Registry = @import("provider.zig").Registry;
@@ -20,10 +21,14 @@ const request_timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(5), .clock
 /// Shutdown joins requests first, then HTTP connections, then credential workers
 /// and model caches; only afterward may the caller release configuration.
 pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !void {
-    var providers = try Registry.init(allocator, io, config.upstreams);
+    var sessions: admin.Session = .{ .allocator = allocator, .io = io };
+    defer sessions.deinit();
+
+    var providers = try Registry.initAccounts(allocator, io, config.upstreams, config.admin_directory);
     defer providers.deinit();
 
-    var listener = try config.address.listen(io, .{});
+    // Rebind immediately after deployment while old connections remain in TIME_WAIT.
+    var listener = try config.address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
@@ -33,7 +38,18 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !v
     var connections: std.Io.Group = .init;
     defer connections.cancel(io);
 
-    std.log.info("event=listening address={f}", .{config.address});
+    std.log.info("event=listening address={f}", .{listener.socket.address});
+    const port = listener.socket.address.getPort();
+    std.log.info("Admin: http://localhost:{d}/admin/ (loopback only; separate admin bearer key)", .{port});
+    if (config.admin_client == null) {
+        std.log.info("Admin management disabled: set {s}; enter its value in the admin page (key never generated or logged)", .{config.admin_key_env});
+    } else {
+        std.log.info("Admin authentication: enter the {s} environment variable value in the page", .{config.admin_key_env});
+    }
+    if (config.upstreams.len == 0) {
+        std.log.info("Remote access: ssh -N -L {d}:127.0.0.1:{d} HOST; open the localhost admin URL", .{ port, port });
+        std.log.info("Login does not enable routing. Configure upstreams and clients explicitly. API-key alternative: OpenCode Go/Zen, upstreams.zen = {{ base_url: https://opencode.ai/zen/v1, auth: {{ provider: api_key, key_env: OPENCODE_ZEN_KEY }} }}; see gateway.example.json", .{});
+    }
 
     while (true) {
         const stream = try listener.accept(io);
@@ -43,7 +59,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !v
             continue;
         }
         const deadline = std.Io.Clock.Timestamp.fromNow(io, request_timeout);
-        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, &providers, &active, deadline }) catch |err| {
+        connections.concurrent(io, handleConnection, .{ allocator, &client, stream, config, &providers, &sessions, &active, deadline }) catch |err| {
             stream.close(io);
             _ = active.fetchSub(1, .monotonic);
             std.log.warn("event=connection_dispatch_failed error={s}", .{@errorName(err)});
@@ -53,6 +69,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !v
 
 const Action = union(enum) {
     inference: inference.Pending,
+    admin: admin.Pending,
     models: struct { request: std.http.Server.Request, client: []const u8 },
 };
 
@@ -62,6 +79,7 @@ fn handleConnection(
     stream: std.Io.net.Stream,
     config: *const Config,
     providers: *Registry,
+    sessions: ?*admin.Session,
     active: *std.atomic.Value(usize),
     deadline: std.Io.Clock.Timestamp,
 ) void {
@@ -78,12 +96,17 @@ fn handleConnection(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var action = (prepareRequestWithDeadline(io, allocator, arena.allocator(), &http, config, deadline) catch |err| {
+    var action = (prepareRequestWithDeadline(io, allocator, arena.allocator(), &http, config, deadline, admin.isLoopback(stream.socket.address), sessions) catch |err| {
         std.log.warn("event=connection_failed error={s}", .{@errorName(err)});
         return;
     }) orelse return;
 
     switch (action) {
+        .admin => |*pending| {
+            admin.handle(pending, arena.allocator(), providers) catch |err| {
+                if (err != error.Canceled) std.log.warn("event=admin_request_failed error={s}", .{@errorName(err)});
+            };
+        },
         .models => |*pending| {
             const body = providers.modelList(client, arena.allocator()) catch |err| {
                 if (err == error.Canceled) return;
@@ -115,9 +138,11 @@ fn prepareRequestWithDeadline(
     http: *std.http.Server,
     config: *const Config,
     deadline: std.Io.Clock.Timestamp,
+    loopback: bool,
+    sessions: ?*admin.Session,
 ) !?Action {
     var completed: std.Io.Semaphore = .{};
-    var task = try io.concurrent(prepareRequest, .{ io, gpa, allocator, http, config, &completed });
+    var task = try io.concurrent(prepareRequest, .{ io, gpa, allocator, http, config, &completed, loopback, sessions });
     // Only request reception is timed; discovery has its own bounded exchange
     // and long-lived inference streams are not cut off.
     defer _ = task.cancel(io) catch null;
@@ -125,11 +150,15 @@ fn prepareRequestWithDeadline(
     return try task.await(io);
 }
 
-fn prepareRequest(io: std.Io, gpa: std.mem.Allocator, allocator: std.mem.Allocator, http: *std.http.Server, config: *const Config, completed: *std.Io.Semaphore) !?Action {
+fn prepareRequest(io: std.Io, gpa: std.mem.Allocator, allocator: std.mem.Allocator, http: *std.http.Server, config: *const Config, completed: *std.Io.Semaphore, loopback: bool, sessions: ?*admin.Session) !?Action {
     defer completed.post(io);
 
     var request = try http.receiveHead();
     const path = request.head.target[0 .. std.mem.findScalar(u8, request.head.target, '?') orelse request.head.target.len];
+    if (std.mem.eql(u8, path, "/admin") or std.mem.startsWith(u8, path, "/admin/")) {
+        const pending = (try admin.prepare(&request, allocator, config, authorizationHeader(&request), loopback, sessions)) orelse return null;
+        return .{ .admin = pending };
+    }
     const client = if (std.mem.startsWith(u8, path, "/v1/") or std.mem.eql(u8, path, "/v1"))
         auth.authenticate(config.clients, authorizationHeader(&request))
     else
@@ -227,7 +256,7 @@ test "HTTP health, authentication, and routing" {
         defer writer.deinit();
         var http = std.http.Server.init(&reader, &writer.writer);
         var completed: std.Io.Semaphore = .{};
-        _ = try prepareRequest(std.testing.io, std.testing.allocator, std.testing.allocator, &http, &config, &completed);
+        _ = try prepareRequest(std.testing.io, std.testing.allocator, std.testing.allocator, &http, &config, &completed, true, null);
         const response = writer.written();
         try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 " ++ case[1]));
         try std.testing.expect(std.mem.find(u8, response, "100 Continue") == null);
@@ -263,11 +292,11 @@ const TransportTest = struct {
 
     fn handle(client: *std.http.Client, stream: std.Io.net.Stream, config: *const Config, registry: ?*Registry, active: *std.atomic.Value(usize)) void {
         if (registry) |providers| {
-            handleConnection(allocator, client, stream, config, providers, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout));
+            handleConnection(allocator, client, stream, config, providers, null, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout));
         } else {
             var providers = Registry.init(allocator, io, config.upstreams) catch unreachable;
             defer providers.deinit();
-            handleConnection(allocator, client, stream, config, &providers, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout));
+            handleConnection(allocator, client, stream, config, &providers, null, active, std.Io.Clock.Timestamp.fromNow(io, request_timeout));
         }
     }
 
@@ -726,7 +755,7 @@ test "transport unavailable SIWC credentials return 503 without sending inferenc
     defer providers.deinit();
     // A terminal refresh failure with an expired token must fail closed. No
     // refresh worker or external network is needed to exercise this state.
-    providers.entries[0].session.?.current.value = providers.entries[0].session.?.current.value.registration();
+    providers.accounts[0].session.current.value = providers.accounts[0].session.current.value.registration();
     var fixture = try T.fixture.Fixture.init(a, T.io, &.{.{ .bytes = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n" }});
     defer fixture.deinit();
     try fixture.start();
@@ -750,7 +779,7 @@ test "transport unavailable SIWC credentials return 503 without sending inferenc
     try std.testing.expect(std.mem.find(u8, raw, "503 Service Unavailable") != null);
     try std.testing.expect(std.mem.find(u8, raw, "upstream_credentials_unavailable") != null);
     try std.testing.expectEqual(0, fixture.count.load(.acquire));
-    try std.testing.expect(!providers.entries[0].session.?.refreshing);
+    try std.testing.expect(!providers.accounts[0].session.refreshing);
 }
 
 test "transport SIWC validates caller auth, JSON, and model aliases locally" {
@@ -782,7 +811,7 @@ test "transport SIWC validates caller auth, JSON, and model aliases locally" {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var completed: std.Io.Semaphore = .{};
-        try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed));
+        try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed, true, null));
         try std.testing.expect(std.mem.find(u8, writer.written(), case[2]) != null);
         try std.testing.expect(std.mem.find(u8, writer.written(), case[3]) != null);
     }
@@ -803,7 +832,7 @@ test "transport oversized request is rejected before reading or inviting body" {
     defer writer.deinit();
     var http = std.http.Server.init(&reader, &writer.writer);
     var completed: std.Io.Semaphore = .{};
-    try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed));
+    try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, arena.allocator(), &http, &config, &completed, true, null));
     try std.testing.expect(std.mem.startsWith(u8, writer.written(), "HTTP/1.1 413 "));
     try std.testing.expect(std.mem.find(u8, writer.written(), "100 Continue") == null);
 }
@@ -1037,4 +1066,202 @@ test "transport one OpenCode upstream serves both native endpoints with shared c
         try std.testing.expectEqual(cases.len, fixture.count.load(.acquire));
         try std.testing.expect(registry.entries[0].catalog.arena == null);
     }
+}
+
+test "transport admin onboarding authorization accounts and safe errors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var registry = try Registry.initAccounts(a, io, &.{}, "/nonexistent/fumo-admin-test");
+    defer registry.deinit();
+    const clients = [_]auth.Client{auth.Client.init("inference", "inference-secret")};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &.{}, .admin_client = auth.Client.init("admin", "admin-secret") };
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    const cases = .{
+        .{ "GET /admin/api/accounts HTTP/1.1\r\nHost: localhost\r\n\r\n", "401 Unauthorized", "unauthorized" },
+        .{ "GET /admin/api/accounts HTTP/1.1\r\nAuthorization: Bearer inference-secret\r\n\r\n", "401 Unauthorized", "unauthorized" },
+        .{ "GET /admin/api/accounts HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nAuthorization: Bearer admin-secret\r\n\r\n", "401 Unauthorized", "unauthorized" },
+        .{ "GET /v1/models HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n", "401 Unauthorized", "unauthorized" },
+        .{ "GET /admin/api/accounts HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n", "200 OK", "\"status\":\"login_required\",\"configured\":false,\"pending\":false" },
+        .{ "POST /admin/api/accounts/codex/auth/disconnect HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n", "500 Internal Server Error", "credential_save_failed" },
+        .{ "POST /admin/api/accounts/missing/auth/start HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n", "404 Not Found", "not_found" },
+        .{ "POST /admin/api/accounts/codex/auth/complete HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 2\r\n\r\n{}", "400 Bad Request", "invalid_request" },
+        .{ "POST /admin/api/accounts/codex/auth/complete HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 20\r\n\r\n{\"callback_url\":\"x\"}", "409 Conflict", "no_pending_login" },
+        .{ "POST /admin/api/accounts/codex/auth/start HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n", "200 OK", "\"expires_in\":300" },
+        .{ "GET /admin/api/accounts HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n", "200 OK", "\"pending\":true" },
+        .{ "POST /admin/api/accounts/codex/auth/complete HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 20\r\n\r\n{\"callback_url\":\"x\"}", "400 Bad Request", "invalid_callback" },
+    };
+    inline for (cases) |case| {
+        const response = try TransportTest.exchange(&client, &config, &registry, case[0]);
+        defer a.free(response);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 " ++ case[1]));
+        try std.testing.expect(std.mem.find(u8, response, case[2]) != null);
+        if (std.mem.startsWith(u8, case[0], "GET /admin") or std.mem.startsWith(u8, case[0], "POST /admin")) {
+            try std.testing.expect(std.mem.find(u8, response, "cache-control: no-store") != null);
+            try std.testing.expect(std.mem.find(u8, response, "access-control-allow-origin") == null);
+        }
+        try std.testing.expect(std.mem.find(u8, response, "admin-secret") == null);
+    }
+}
+
+test "transport admin assets revalidate without caching API responses or errors" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var registry = try Registry.initAccounts(a, std.testing.io, &.{}, "/nonexistent/fumo-admin-cache-test");
+    defer registry.deinit();
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &.{}, .upstreams = &.{}, .admin_client = auth.Client.init("admin", "admin-secret") };
+    var client: std.http.Client = .{ .allocator = a, .io = std.testing.io };
+    defer client.deinit();
+    const cases = .{
+        .{ "/admin/", "text/html; charset=utf-8" },
+        .{ "/admin", "text/html; charset=utf-8" },
+        .{ "/admin/logo.svg", "image/svg+xml" },
+        .{ "/admin/assets/admin.js", "text/javascript; charset=utf-8" },
+        .{ "/admin/assets/admin.css", "text/css; charset=utf-8" },
+    };
+    inline for (cases) |case| {
+        const raw = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{case[0]});
+        const first = try TransportTest.exchange(&client, &config, &registry, raw);
+        defer a.free(first);
+        try std.testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 "));
+        try std.testing.expect(std.mem.find(u8, first, "cache-control: no-cache\r\n") != null);
+        try std.testing.expect(std.mem.find(u8, first, "content-type: " ++ case[1] ++ "\r\n") != null);
+        const start = (std.mem.find(u8, first, "etag: ") orelse return error.TestUnexpectedResult) + "etag: ".len;
+        const end = start + (std.mem.find(u8, first[start..], "\r\n") orelse return error.TestUnexpectedResult);
+        const etag = first[start..end];
+        try std.testing.expectEqual(@as(usize, 66), etag.len);
+        try std.testing.expect(etag[0] == '"' and etag[etag.len - 1] == '"');
+        const body = first[(std.mem.find(u8, first, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4 ..];
+        try std.testing.expect(body.len > 0);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+        try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), etag[1 .. etag.len - 1]);
+        const validators = [_][]const u8{
+            etag,
+            try std.fmt.allocPrint(allocator, "W/{s}", .{etag}),
+            try std.fmt.allocPrint(allocator, "\"stale\", W/{s}, \"other\"", .{etag}),
+            "*",
+        };
+        for (validators) |validator| {
+            const conditional = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {s}\r\n\r\n", .{ case[0], validator });
+            const cached = try TransportTest.exchange(&client, &config, &registry, conditional);
+            defer a.free(cached);
+            try std.testing.expect(std.mem.startsWith(u8, cached, "HTTP/1.1 304 "));
+            try std.testing.expect(std.mem.endsWith(u8, cached, "\r\n\r\n"));
+            try std.testing.expect(std.mem.find(u8, cached, "content-length:") == null);
+            try std.testing.expect(std.mem.find(u8, cached, "transfer-encoding:") == null);
+            try std.testing.expect(std.mem.find(u8, cached, "cache-control: no-cache\r\n") != null);
+            try std.testing.expect(std.mem.find(u8, cached, etag) != null);
+            try std.testing.expect(std.mem.find(u8, cached, "x-content-type-options: nosniff\r\n") != null);
+        }
+        const stale = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"stale\"\r\n\r\n", .{case[0]});
+        const changed = try TransportTest.exchange(&client, &config, &registry, stale);
+        defer a.free(changed);
+        try std.testing.expectEqualStrings(first, changed);
+    }
+    for ([_][]const u8{ "/admin/api/accounts", "/admin/api/missing", "/admin/missing.svg" }) |path| {
+        const raw = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nIf-None-Match: *\r\n\r\n", .{path});
+        const response = try TransportTest.exchange(&client, &config, &registry, raw);
+        defer a.free(response);
+        try std.testing.expect(std.mem.find(u8, response, "cache-control: no-store\r\n") != null);
+        try std.testing.expect(std.mem.find(u8, response, "etag:") == null);
+        try std.testing.expect(!std.mem.startsWith(u8, response, "HTTP/1.1 304 "));
+    }
+}
+
+test "transport admin reports credential status independently of routing configuration" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var registry = try Registry.initAccounts(a, io, &.{}, "/nonexistent/fumo-admin-status-test");
+    defer registry.deinit();
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &.{}, .upstreams = &.{}, .admin_client = auth.Client.init("admin", "admin-secret") };
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    const session = &registry.accounts[0].session;
+    for ([_]bool{ false, true }) |configured| {
+        registry.accounts[0].configured = configured;
+        session.current.value.client_id = "client";
+        session.current.value.access_token = "expired-access";
+        session.current.value.refresh_token = "refresh";
+        session.current.value.refresh_status = .ready;
+        const refreshable = try TransportTest.exchange(&client, &config, &registry, "GET /admin/api/accounts HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n");
+        defer a.free(refreshable);
+        try std.testing.expect(std.mem.find(u8, refreshable, "\"status\":\"connected\"") != null);
+        try std.testing.expect(!session.refreshing);
+        session.current.value.refresh_status = .invalid_client;
+        const reconnect = try TransportTest.exchange(&client, &config, &registry, "GET /admin/api/accounts HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n");
+        defer a.free(reconnect);
+        try std.testing.expect(std.mem.find(u8, reconnect, "\"status\":\"login_required\"") != null);
+    }
+}
+
+test "transport admin rejects remote and disabled management before inviting body" {
+    const cases = .{
+        .{ false, @as(?auth.Client, auth.Client.init("admin", "admin-secret")), "403 Forbidden", "loopback_required" },
+        .{ true, @as(?auth.Client, null), "503 Service Unavailable", "admin_disabled" },
+    };
+    inline for (cases) |case| {
+        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &.{}, .upstreams = &.{}, .admin_client = case[1] };
+        var reader = std.Io.Reader.fixed("POST /admin/api/accounts/codex/auth/complete HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\n\r\n");
+        var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer writer.deinit();
+        var http = std.http.Server.init(&reader, &writer.writer);
+        var completed: std.Io.Semaphore = .{};
+        try std.testing.expectEqual(null, try prepareRequest(std.testing.io, std.testing.allocator, std.testing.allocator, &http, &config, &completed, case[0], null));
+        try std.testing.expect(std.mem.find(u8, writer.written(), case[2]) != null);
+        try std.testing.expect(std.mem.find(u8, writer.written(), case[3]) != null);
+        try std.testing.expect(std.mem.find(u8, writer.written(), "100 Continue") == null);
+    }
+    try std.testing.expect(admin.isLoopback(try std.Io.net.IpAddress.parse("127.0.0.1", 80)));
+    try std.testing.expect(admin.isLoopback(try std.Io.net.IpAddress.parse("::1", 80)));
+    try std.testing.expect(!admin.isLoopback(try std.Io.net.IpAddress.parse("192.0.2.1", 80)));
+}
+
+test "transport admin callback body reception obeys request deadline" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer listener.deinit(io);
+    const sender = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer sender.close(io);
+    const receiver = try listener.accept(io);
+    defer receiver.close(io);
+    var send_buffer: [1024]u8 = undefined;
+    var sender_writer = sender.writer(io, &send_buffer);
+    try sender_writer.interface.writeAll("POST /admin/api/accounts/codex/auth/complete HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 100\r\n\r\n{");
+    try sender_writer.interface.flush();
+    var read_buffer: [8192]u8 = undefined;
+    var write_buffer: [1024]u8 = undefined;
+    var reader = receiver.reader(io, &read_buffer);
+    var writer = receiver.writer(io, &write_buffer);
+    var http = std.http.Server.init(&reader.interface, &writer.interface);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &.{}, .upstreams = &.{}, .admin_client = auth.Client.init("admin", "admin-secret") };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(100), .clock = .awake });
+    try std.testing.expectError(error.Timeout, prepareRequestWithDeadline(io, a, arena.allocator(), &http, &config, deadline, true, null));
+}
+
+test "transport admin disconnect persists and clears pending login" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(io, .fromMode(0o700));
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var registry = try Registry.initAccounts(a, io, &.{}, path);
+    defer registry.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &.{}, .upstreams = &.{}, .admin_client = auth.Client.init("admin", "admin-secret") };
+    const started = try registry.accounts[0].session.startAuth(a);
+    defer a.free(started.authorization_url);
+    const response = try TransportTest.exchange(&client, &config, &registry, "POST /admin/api/accounts/codex/auth/disconnect HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\n\r\n");
+    defer a.free(response);
+    try std.testing.expect(std.mem.find(u8, response, "200 OK") != null);
+    try std.testing.expect(std.mem.find(u8, response, "{\"status\":\"login_required\"}") != null);
+    try std.testing.expect(!(try registry.accounts[0].session.status()).pending);
 }

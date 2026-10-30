@@ -1,98 +1,17 @@
 const std = @import("std");
 const storage = @import("codex/credentials.zig");
-const Callback = @import("codex/callback.zig").Callback;
 const Grant = @import("codex/callback.zig").Grant;
 
 const auth_origin = "https://auth.openai.com";
 const resource = "https://api.openai.com/v1";
 const scope = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 
-pub fn login(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !void {
-    var auth: Login = .{ .http = .{ .allocator = allocator, .io = io } };
-    defer auth.http.deinit();
-    try auth.run(directory);
-}
-
-pub fn refresh(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !void {
-    var auth: Refresh = .{ .http = .{ .allocator = allocator, .io = io } };
-    defer auth.http.deinit();
-    try auth.run(directory);
-}
-
 /// SIWC registration and returning authorization.
 /// Origin, port, and deadline injection are for local tests, not CLI options.
 pub const Login = struct {
     http: std.http.Client,
     origin: []const u8 = auth_origin,
-    callback_port: u16 = 1455,
-    timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(5 * 60), .clock = .awake },
-
-    pub fn run(self: *Login, directory: []const u8) !void {
-        const io = self.http.io;
-        const saved = try prepareHost(self.http.allocator, io, directory);
-        defer saved.deinit();
-
-        var callback = try Callback.listen(io, self.callback_port);
-        defer callback.deinit(io);
-
-        var arena = std.heap.ArenaAllocator.init(self.http.allocator);
-        defer arena.deinit();
-
-        const allocator = arena.allocator();
-        var authorization = try Authorization.init(io, saved.value);
-        const redirect_uri = try callback.redirectUri(allocator);
-        const url = try authorization.url(allocator, self.origin, redirect_uri);
-
-        try showAuthorization(io, url);
-        try self.complete(allocator, directory, &callback, &authorization, redirect_uri);
-
-        showSuccess(io, "SIWC credentials saved.\n") catch {};
-    }
-
-    fn complete(self: *Login, allocator: std.mem.Allocator, directory: []const u8, callback: *Callback, authorization: *Authorization, redirect_uri: []const u8) !void {
-        const new_registration = authorization.client_id == null;
-        const credentials = self.authorizeWithDeadline(allocator, callback, authorization, redirect_uri) catch |err| {
-            // A validated callback can establish registration even when its
-            // exchange fails. Never replace an active/returning session here.
-            if (new_registration and authorization.client_id != null) {
-                try storage.save(self.http.allocator, self.http.io, directory, .{
-                    .device_id = authorization.device_id,
-                    .client_id = authorization.client_id.?,
-                });
-            }
-            return err;
-        };
-        // Persistence is the commit, outside the authorization deadline. Neither
-        // timeout cancellation nor a broken confirmation pipe can undo success.
-        try storage.save(self.http.allocator, self.http.io, directory, credentials);
-    }
-
-    /// allocator must be arena-backed and outlive the returned credentials.
-    /// The caller reclaims all authorization state, including on error.
-    fn authorizeWithDeadline(self: *Login, allocator: std.mem.Allocator, callback: *Callback, authorization: *Authorization, redirect_uri: []const u8) !storage.Credentials {
-        const io = self.http.io;
-        const deadline = std.Io.Clock.Timestamp.fromNow(io, self.timeout);
-        var completed: std.Io.Semaphore = .{};
-        var task = try io.concurrent(authorize, .{ self, allocator, callback, authorization, redirect_uri, &completed });
-        // The result borrows the caller's arena; joining must precede its deinit.
-        defer {
-            if (task.cancel(io)) |_| {} else |_| {}
-        }
-        completed.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
-            error.Timeout => return error.LoginTimedOut,
-            else => return err,
-        };
-        return try task.await(io);
-    }
-
-    fn authorize(self: *Login, allocator: std.mem.Allocator, callback: *Callback, authorization: *Authorization, redirect_uri: []const u8, completed: *std.Io.Semaphore) !storage.Credentials {
-        defer completed.post(self.http.io);
-        const grant = try callback.wait(allocator, self.http.io, &authorization.state, authorization.client_id);
-        authorization.client_id = grant.client_id;
-        return self.exchange(allocator, grant, authorization, redirect_uri);
-    }
-
-    fn exchange(self: *Login, allocator: std.mem.Allocator, grant: Grant, authorization: *const Authorization, redirect_uri: []const u8) !storage.Credentials {
+    pub fn exchange(self: *Login, allocator: std.mem.Allocator, grant: Grant, authorization: *const Authorization, redirect_uri: []const u8) !storage.Credentials {
         const body = try encodeParameters(allocator, &.{
             .{ .name = "grant_type", .value = "authorization_code" },
             .{ .name = "client_id", .value = grant.client_id },
@@ -113,26 +32,11 @@ pub const Login = struct {
     }
 };
 
-/// One SIWC refresh exchange, shared by the explicit command and service-owned
-/// credential session. The caller owns retries, persistence, and coordination.
+/// One SIWC refresh exchange, used by the service-owned credential session. The caller owns retries, persistence, and coordination.
 pub const Refresh = struct {
     http: std.http.Client,
     origin: []const u8 = auth_origin,
     timeout: std.Io.Clock.Duration = .{ .raw = .fromSeconds(30), .clock = .awake },
-
-    pub fn run(self: *Refresh, directory: []const u8) !void {
-        var current = try storage.load(self.http.allocator, self.http.io, directory);
-        defer current.deinit();
-        var arena = std.heap.ArenaAllocator.init(self.http.allocator);
-        defer arena.deinit();
-        const credentials = self.exchange(arena.allocator(), current.value) catch |err| {
-            if (recovery(current.value, err)) |retained| try storage.save(self.http.allocator, self.http.io, directory, retained);
-            return err;
-        };
-        // Saving is the commit, outside the network deadline, just as for login.
-        try storage.save(self.http.allocator, self.http.io, directory, credentials);
-        showSuccess(self.http.io, "SIWC credentials refreshed.\n") catch {};
-    }
 
     /// A terminal renewal failure is not a transient infrastructure failure.
     /// Unusable refresh tokens end this token session, not its registration.
@@ -234,25 +138,14 @@ fn postTokens(http: *std.http.Client, origin: []const u8, arena_allocator: std.m
     return .{ .status = status, .body = try response.reader(&.{}).allocRemaining(arena_allocator, .limited(1024 * 1024)) };
 }
 
-fn prepareHost(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !std.json.Parsed(storage.Credentials) {
-    return storage.load(allocator, io, directory) catch |err| switch (err) {
-        error.FileNotFound => {
-            const device_id = try deviceId(io);
-            try storage.save(allocator, io, directory, .{ .device_id = &device_id });
-            return storage.load(allocator, io, directory);
-        },
-        else => return err,
-    };
-}
-
-const Authorization = struct {
+pub const Authorization = struct {
     state: [43]u8,
     nonce: [43]u8,
     verifier: [43]u8,
     device_id: []const u8,
     client_id: ?[]const u8,
 
-    fn init(io: std.Io, saved: storage.Credentials) !Authorization {
+    pub fn init(io: std.Io, saved: storage.Credentials) !Authorization {
         return .{
             .state = try randomToken(io),
             .nonce = try randomToken(io),
@@ -262,7 +155,7 @@ const Authorization = struct {
         };
     }
 
-    fn url(self: *const Authorization, allocator: std.mem.Allocator, origin: []const u8, redirect_uri: []const u8) ![]u8 {
+    pub fn url(self: *const Authorization, allocator: std.mem.Allocator, origin: []const u8, redirect_uri: []const u8) ![]u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&self.verifier, &digest, .{});
 
@@ -311,7 +204,7 @@ fn randomToken(io: std.Io) ![43]u8 {
     return encoded;
 }
 
-fn deviceId(io: std.Io) ![36]u8 {
+pub fn deviceId(io: std.Io) ![36]u8 {
     var bytes: [16]u8 = undefined;
     try io.randomSecure(&bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -346,20 +239,6 @@ fn parseCredentials(allocator: std.mem.Allocator, body: []const u8, client_id: [
         .expires_at = std.math.add(i64, now, expires_in) catch return error.InvalidTokenExpiry,
         .obtained_at = now,
     };
-}
-
-fn showAuthorization(io: std.Io, url: []const u8) !void {
-    var buffer: [2048]u8 = undefined;
-    var output = std.Io.File.stdout().writer(io, &buffer);
-    try output.interface.print("Open this URL in your browser:\n{s}\nWaiting for the SIWC callback (up to 5 minutes)...\n", .{url});
-    try output.interface.flush();
-}
-
-fn showSuccess(io: std.Io, message: []const u8) !void {
-    var buffer: [256]u8 = undefined;
-    var output = std.Io.File.stdout().writer(io, &buffer);
-    try output.interface.writeAll(message);
-    try output.interface.flush();
 }
 
 test "SIWC authorization has fresh proof values and binds the saved host and registration" {
@@ -445,19 +324,6 @@ fn authTestReply(allocator: std.mem.Allocator, status: []const u8, body: []const
     return allocator.print("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, body.len, body });
 }
 
-fn authTestCallback(io: std.Io, uri: []const u8, state: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const url = try arena.allocator().print("{s}?state={s}&code=code%20%2B%2F%26%3D%3F%25&client_id=issued-client", .{ uri, state });
-    var http: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
-    defer http.deinit();
-    var request = try http.request(.GET, try std.Uri.parse(url), .{ .keep_alive = false });
-    defer request.deinit();
-    try request.sendBodiless();
-    const response = try request.receiveHead(&.{});
-    try std.testing.expectEqual(std.http.Status.ok, response.head.status);
-}
-
 fn authTestPrivate(dir: std.Io.Dir) !void {
     const io = std.testing.io;
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), (try dir.stat(io)).permissions.toMode() & 0o777);
@@ -468,7 +334,7 @@ fn authTestPrivate(dir: std.Io.Dir) !void {
     try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try iterator.next(io));
 }
 
-test "login callback exchanges issued grant and commits private replacement" {
+test "login exchange sends PKCE grant and binds issued registration" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const reply = try authTestReply(a, "200 OK", auth_test_tokens);
@@ -478,26 +344,13 @@ test "login callback exchanges issued grant and commits private replacement" {
     try fixture.start();
     const origin = try fixture.origin(a);
     defer a.free(origin);
-    var login_test: Login = .{ .http = .{ .allocator = a, .io = io }, .origin = origin, .timeout = .{ .raw = .fromSeconds(2), .clock = .awake } };
-    defer login_test.http.deinit();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    try tmp.dir.setPermissions(io, .fromMode(0o700));
-    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(path);
-    const host = try prepareHost(a, io, path);
-    defer host.deinit();
-    var callback = try Callback.listen(io, 0);
-    defer callback.deinit(io);
-    const uri = try callback.redirectUri(a);
-    defer a.free(uri);
-    var authorization = try Authorization.init(io, host.value);
-    var browser = try io.concurrent(authTestCallback, .{ io, uri, &authorization.state });
-    defer _ = browser.cancel(io) catch {};
+    var login: Login = .{ .http = .{ .allocator = a, .io = io }, .origin = origin };
+    defer login.http.deinit();
+    const authorization = try Authorization.init(io, .{ .device_id = "device" });
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    try login_test.complete(arena.allocator(), path, &callback, &authorization, uri);
-    try browser.await(io);
+    const uri = "http://127.0.0.1:1455/auth/callback";
+    const credentials = try login.exchange(arena.allocator(), .{ .code = "code +/&=?%", .client_id = "issued-client" }, &authorization, uri);
     try fixture.waitRequest();
     const expected = try encodeParameters(a, &.{
         .{ .name = "grant_type", .value = "authorization_code" },
@@ -509,68 +362,10 @@ test "login callback exchanges issued grant and commits private replacement" {
     });
     defer a.free(expected);
     try authTestRequest(fixture.requests[0].?, expected);
-    const saved = try prepareHost(a, io, path);
-    defer saved.deinit();
-    try std.testing.expectEqualStrings("new-access", saved.value.access_token);
-    try std.testing.expectEqualStrings("issued-client", saved.value.client_id);
-    try std.testing.expectEqualStrings(authorization.device_id, saved.value.device_id);
-    try std.testing.expectEqual(@as(i64, 1234), saved.value.expires_at - saved.value.obtained_at);
-    try authTestPrivate(tmp.dir);
-}
-
-test "failed code exchange retains new registration but never replaces an active session" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    const Case = struct { returning: bool, transient: bool };
-    for ([_]Case{
-        .{ .returning = false, .transient = false },
-        .{ .returning = false, .transient = true },
-        .{ .returning = true, .transient = true },
-    }) |case| {
-        const returning = case.returning;
-        const reply = try authTestReply(a, if (case.transient) "500 Internal Server Error" else "400 Bad Request", if (case.transient) "{\"error\":\"server_error\"}" else "{\"error\":\"invalid_grant\"}");
-        defer a.free(reply);
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        try tmp.dir.setPermissions(io, .fromMode(0o700));
-        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
-        defer a.free(path);
-        if (returning) try storage.save(a, io, path, auth_test_current);
-        const before = try prepareHost(a, io, path);
-        defer before.deinit();
-        const retry = try prepareHost(a, io, path);
-        defer retry.deinit();
-        try std.testing.expectEqualStrings(before.value.device_id, retry.value.device_id);
-        const original = try tmp.dir.readFileAlloc(io, "codex.json", a, .limited(4096));
-        defer a.free(original);
-        var fixture = try AuthFixture.init(a, io, &.{.{ .bytes = reply }});
-        defer fixture.deinit();
-        try fixture.start();
-        const origin = try fixture.origin(a);
-        defer a.free(origin);
-        var auth: Login = .{ .http = .{ .allocator = a, .io = io }, .origin = origin };
-        defer auth.http.deinit();
-        var callback = try Callback.listen(io, 0);
-        defer callback.deinit(io);
-        const uri = try callback.redirectUri(a);
-        defer a.free(uri);
-        var pending = try Authorization.init(io, before.value);
-        var browser = try io.concurrent(authTestCallback, .{ io, uri, &pending.state });
-        defer _ = browser.cancel(io) catch {};
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        try std.testing.expectError(if (case.transient) error.TokenExchangeFailed else error.CodeExchangeInvalidGrant, auth.complete(arena.allocator(), path, &callback, &pending, uri));
-        try browser.await(io);
-        const after = try prepareHost(a, io, path);
-        defer after.deinit();
-        try std.testing.expectEqualStrings(before.value.device_id, after.value.device_id);
-        try std.testing.expectEqualStrings("issued-client", after.value.client_id);
-        if (returning) {
-            const unchanged = try tmp.dir.readFileAlloc(io, "codex.json", a, .limited(4096));
-            defer a.free(unchanged);
-            try std.testing.expectEqualStrings(original, unchanged);
-        } else try std.testing.expectEqualStrings("", after.value.access_token);
-    }
+    try std.testing.expectEqualStrings("new-access", credentials.access_token);
+    try std.testing.expectEqualStrings("issued-client", credentials.client_id);
+    try std.testing.expectEqualStrings("device", credentials.device_id);
+    try std.testing.expectEqual(@as(i64, 1234), credentials.expires_at - credentials.obtained_at);
 }
 
 fn authTestRequest(raw: []const u8, body: []const u8) !void {
@@ -634,49 +429,5 @@ test "refresh rotates credentials and preserves bytes on HTTP parse and timeout 
         try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
         try authTestRequest(fixture.requests[0].?, "grant_type=refresh_token&client_id=issued-client&refresh_token=old-refresh%20%2B%2F%26%3D%3F%25&resource=https%3A%2F%2Fapi.openai.com%2Fv1");
         try authTestPrivate(tmp.dir);
-    }
-}
-
-test "login deadline cancels idle callback partial headers and stalled exchange" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    for (0..3) |phase| {
-        var gate: std.Io.Semaphore = .{};
-        var fixture = try AuthFixture.init(a, io, &.{.{ .bytes = "", .gate = &gate }});
-        defer fixture.deinit();
-        try fixture.start();
-        const origin = try fixture.origin(a);
-        defer a.free(origin);
-        var auth: Login = .{ .http = .{ .allocator = a, .io = io }, .origin = origin, .timeout = .{ .raw = .fromMilliseconds(250), .clock = .awake } };
-        defer auth.http.deinit();
-        var callback = try Callback.listen(io, 0);
-        defer callback.deinit(io);
-        const uri = try callback.redirectUri(a);
-        defer a.free(uri);
-        var authorization = try Authorization.init(io, auth_test_current.registration());
-        const partial = if (phase == 1) try callback.server.socket.address.connect(io, .{ .mode = .stream }) else null;
-        defer if (partial) |stream| stream.close(io);
-        if (partial) |stream| {
-            var buffer: [128]u8 = undefined;
-            var writer = stream.writer(io, &buffer);
-            try writer.interface.writeAll("GET /auth/callback HTTP/1.1\r\nHost: localhost\r\n");
-            try writer.interface.flush();
-        }
-        var browser = if (phase == 2) try io.concurrent(authTestCallback, .{ io, uri, &authorization.state }) else null;
-        defer {
-            if (browser) |*task| {
-                _ = task.cancel(io) catch {};
-            }
-        }
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const before = std.Io.Clock.awake.now(io);
-        try std.testing.expectError(error.LoginTimedOut, auth.authorizeWithDeadline(arena.allocator(), &callback, &authorization, uri));
-        try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
-        // The deadline may win before the callback is accepted under load.
-        // Never await a browser request after its server task was canceled.
-        if (browser) |*task| _ = task.cancel(io) catch {};
-        if (phase == 2) try fixture.waitRequest();
-        try std.testing.expectEqual(@as(usize, if (phase == 2) 1 else 0), fixture.count.load(.acquire));
     }
 }

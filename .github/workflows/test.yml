@@ -1,25 +1,39 @@
 name: Tests
 
 on:
-  push:
-  pull_request:
-  workflow_dispatch:
+    push:
+    pull_request:
+    workflow_dispatch:
 
 permissions:
-  contents: read
+    contents: read
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+    linux:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
-      - name: Check Zig formatting
-        run: nix develop --command zig fmt --check build.zig src tests
+            - name: Install frontend dependencies
+              run: nix develop --command bun install --cwd web --frozen-lockfile
 
-      - name: Run debug tests
-        run: nix develop --command zig build test -Doptimize=Debug --summary all
+            - name: Check frontend
+              run: |
+                  nix develop --command bun run --cwd web lint
+                  nix develop --command bun run --cwd web typecheck
 
-      - name: Build and test Nix package
-        run: nix build .#packages.x86_64-linux.default --no-link --print-build-logs
+            - name: Run browser smoke test
+              run: |
+                  cd web
+                  nix develop .. --command bun --bun playwright install --with-deps chromium
+                  nix develop .. --command bun run test:browser
+
+            - name: Check Zig formatting
+              run: nix develop --command zig fmt --check build.zig src tests
+
+            - name: Run debug tests
+              run: nix develop --command zig build test -Doptimize=Debug --summary all
+
+            - name: Build and test Nix package
+              run: nix build .#packages.x86_64-linux.default --no-link --print-build-logs

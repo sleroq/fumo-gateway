@@ -3,40 +3,28 @@ const std = @import("std");
 pub const usage =
     \\usage:
     \\  fumo-gateway --config <path>
-    \\  fumo-gateway auth login codex [--credentials-dir <directory>]
-    \\  fumo-gateway auth refresh codex [--credentials-dir <directory>]
 ;
 
 pub const Command = union(enum) {
     serve: []const u8,
-    login_codex: ?[]const u8,
-    refresh_codex: ?[]const u8,
 };
 
 pub fn parse(args: []const []const u8) !Command {
     if (args.len == 2 and std.mem.eql(u8, args[0], "--config")) return .{ .serve = args[1] };
-    if ((args.len == 3 or args.len == 5) and
-        std.mem.eql(u8, args[0], "auth") and
-        std.mem.eql(u8, args[2], "codex"))
-    {
-        const directory: ?[]const u8 = if (args.len == 3) null else if (std.mem.eql(u8, args[3], "--credentials-dir") and args[4].len != 0) args[4] else return error.InvalidArguments;
-        if (std.mem.eql(u8, args[1], "login")) return .{ .login_codex = directory };
-        if (std.mem.eql(u8, args[1], "refresh")) return .{ .refresh_codex = directory };
-    }
     return error.InvalidArguments;
 }
 
-test "serve and standalone Codex authentication commands" {
+test "serve is the only command; provider authentication is web-only" {
     const serve = try parse(&.{ "--config", "gateway.json" });
     try std.testing.expectEqualStrings("gateway.json", serve.serve);
-    try std.testing.expect((try parse(&.{ "auth", "login", "codex" })).login_codex == null);
-    try std.testing.expectEqualStrings("/private/state", (try parse(&.{ "auth", "login", "codex", "--credentials-dir", "/private/state" })).login_codex.?);
-    try std.testing.expect((try parse(&.{ "auth", "refresh", "codex" })).refresh_codex == null);
-    try std.testing.expectEqualStrings("/private/state", (try parse(&.{ "auth", "refresh", "codex", "--credentials-dir", "/private/state" })).refresh_codex.?);
     for ([_][]const []const u8{
         &.{},
         &.{"--config"},
         &.{ "auth", "login" },
+        &.{ "auth", "login", "codex" },
+        &.{ "auth", "refresh", "codex" },
+        &.{ "auth", "login", "codex", "--credentials-dir", "/private/state" },
+        &.{ "auth", "refresh", "codex", "--credentials-dir", "/private/state" },
         &.{ "auth", "login", "unknown" },
         &.{ "auth", "refresh", "unknown" },
         &.{ "auth", "unknown", "codex" },

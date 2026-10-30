@@ -1,0 +1,87 @@
+:root {
+    font-family: system-ui, sans-serif;
+    color-scheme: light dark;
+    line-height: 1.5;
+}
+* {
+    box-sizing: border-box;
+}
+main {
+    max-width: 42rem;
+    margin: 2rem auto;
+    padding: 0 1rem;
+}
+header,
+.account,
+.actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+header {
+    justify-content: space-between;
+}
+h1 {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.5rem;
+}
+h2 {
+    font-size: 1.125rem;
+}
+form {
+    display: grid;
+    gap: 0.5rem;
+    margin-block: 1rem;
+}
+button,
+input {
+    font: inherit;
+    padding: 0.5rem 0.75rem;
+    min-height: 40px;
+}
+.icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    padding: 0.5rem;
+}
+input {
+    width: 100%;
+    min-width: 0;
+}
+form > button {
+    justify-self: start;
+}
+ul {
+    list-style: none;
+    padding: 0;
+}
+.account {
+    padding-block: 1rem;
+    border-bottom: 1px solid GrayText;
+}
+.account-info {
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+.accounts-loading .account-info > *,
+.accounts-loading .account > button {
+    color: transparent;
+    background: color-mix(in srgb, GrayText 18%, transparent);
+    border-color: transparent;
+    border-radius: 0.25rem;
+    user-select: none;
+}
+.accounts-loading .account-info > div {
+    width: fit-content;
+}
+section {
+    margin-block: 1.5rem;
+}
+[role="alert"] {
+    font-weight: 600;
+}

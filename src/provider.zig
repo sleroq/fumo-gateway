@@ -87,30 +87,19 @@ pub const Upstream = struct {
     }
 };
 
-/// Stable-address service state. Definitions borrow Config; requests and cache
-/// refreshes must finish before deinit, which joins the credential worker.
+/// Provider state borrows Config and Account; owns only the model catalog.
 pub const Provider = struct {
     upstream: Upstream,
-    session: ?Session = null,
     catalog: models.Cache,
-
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, upstream: Upstream) !Provider {
-        try upstream.validateEndpoint();
-        return .{
-            .upstream = upstream,
-            .session = if (upstream.auth == .codex) try Session.init(allocator, io, upstream.auth.codex) else null,
-            .catalog = .{ .allocator = allocator },
-        };
-    }
+    account: ?*Account = null,
 
     pub fn deinit(self: *Provider) void {
-        if (self.session) |*session| session.deinit();
         self.catalog.deinit();
         self.* = undefined;
     }
 
     pub fn authorization(self: *Provider, allocator: std.mem.Allocator) !?[]const u8 {
-        if (self.session) |*session| return try session.authorization(allocator);
+        if (self.account) |account| return try account.session.authorization(allocator);
 
         return switch (self.upstream.auth) {
             .api_key => |key| try allocator.print("Bearer {s}", .{key}),
@@ -148,29 +137,88 @@ pub const Provider = struct {
     }
 };
 
-/// Fixed provider storage: sessions cannot move after their workers start.
+/// Owns the credential session shared by providers using the same directory.
+pub const Account = struct {
+    id: []const u8,
+    directory: []u8,
+    configured: bool,
+    session: Session,
+};
+
+/// Fixed account storage: sessions cannot move after their workers start.
 /// The caller joins all requests before deinit and keeps Config alive until after it.
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     entries: []Provider,
+    accounts: []Account,
+    account_storage: []Account,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, upstreams: []const Upstream) !Registry {
+        return initAccounts(allocator, io, upstreams, null);
+    }
+
+    pub fn initAccounts(allocator: std.mem.Allocator, io: std.Io, upstreams: []const Upstream, default_directory: ?[]const u8) !Registry {
+        const accounts = try allocator.alloc(Account, upstreams.len + 1);
+        errdefer allocator.free(accounts);
+        var count: usize = 0;
+        errdefer for (accounts[0..count]) |*account| {
+            account.session.deinit();
+            allocator.free(account.directory);
+        };
         const entries = try allocator.alloc(Provider, upstreams.len);
         errdefer allocator.free(entries);
         var initialized: usize = 0;
         errdefer for (entries[0..initialized]) |*entry| entry.deinit();
-
         for (entries, upstreams) |*entry, upstream| {
-            entry.* = try Provider.init(allocator, io, upstream);
+            try upstream.validateEndpoint();
+            entry.* = .{ .upstream = upstream, .catalog = .{ .allocator = allocator } };
             initialized += 1;
+            if (upstream.auth != .codex) continue;
+            const directory = try normalizeDirectory(allocator, io, upstream.auth.codex);
+            var directory_owned = true;
+            defer if (directory_owned) allocator.free(directory);
+            var found: ?*Account = null;
+            for (accounts[0..count]) |*account| {
+                if (std.mem.eql(u8, directory, account.directory)) {
+                    found = account;
+                    break;
+                }
+            }
+            if (found == null) {
+                accounts[count] = .{ .id = upstream.name, .directory = directory, .configured = true, .session = try Session.init(allocator, io, directory) };
+                directory_owned = false;
+                found = &accounts[count];
+                count += 1;
+            }
+            found.?.configured = true;
+            entry.account = found;
         }
+        if (count == 0) {
+            if (default_directory) |directory| {
+                const normalized = try normalizeDirectory(allocator, io, directory);
+                errdefer allocator.free(normalized);
+                accounts[count] = .{ .id = "codex", .directory = normalized, .configured = false, .session = try Session.init(allocator, io, normalized) };
+                count += 1;
+            }
+        }
+        return .{ .allocator = allocator, .entries = entries, .accounts = accounts[0..count], .account_storage = accounts };
+    }
 
-        return .{ .allocator = allocator, .entries = entries };
+    fn normalizeDirectory(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(directory)) return std.fs.path.resolve(allocator, &.{directory});
+        const cwd = try std.process.currentPathAlloc(io, allocator);
+        defer allocator.free(cwd);
+        return std.fs.path.resolve(allocator, &.{ cwd, directory });
     }
 
     pub fn deinit(self: *Registry) void {
         for (self.entries) |*entry| entry.deinit();
+        for (self.accounts) |*account| {
+            account.session.deinit();
+            self.allocator.free(account.directory);
+        }
         self.allocator.free(self.entries);
+        self.allocator.free(self.account_storage);
         self.* = undefined;
     }
 
@@ -390,19 +438,64 @@ test "provider request depth ignores string delimiters and counts nesting rather
     try std.testing.expect(std.mem.find(u8, routed.body, "\"model\":\"model\"") != null);
 }
 
-test "provider credential initialization cannot bypass endpoint pinning" {
-    try std.testing.expectError(error.InvalidCodexEndpoint, Provider.init(std.testing.allocator, std.testing.io, .{
+test "provider registry initialization cannot bypass endpoint pinning" {
+    try std.testing.expectError(error.InvalidCodexEndpoint, Registry.init(std.testing.allocator, std.testing.io, &.{.{
         .name = "codex",
         .base_url = "http://127.0.0.1/v1",
         .auth = .{ .codex = "/unused" },
-    }));
+    }}));
 }
 
-test "provider registry frees already initialized providers on credential load failure" {
+test "provider registry allows disconnected credential storage" {
     const a = std.testing.allocator;
     const upstreams = [_]Upstream{
         .{ .name = "public", .base_url = "http://localhost/v1" },
         .{ .name = "codex", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/nonexistent/fumo-gateway-credentials" } },
     };
-    try std.testing.expectError(error.FileNotFound, Registry.init(a, std.testing.io, &upstreams));
+    var registry = try Registry.init(a, std.testing.io, &upstreams);
+    defer registry.deinit();
+    try std.testing.expectEqual(1, registry.accounts.len);
+}
+
+test "provider registry deduplicates credential storage and gives custom accounts unique ids" {
+    const upstreams = [_]Upstream{
+        .{ .name = "codex", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/nonexistent/fumo-custom" } },
+        .{ .name = "shared", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/nonexistent/unused/../fumo-custom/" } },
+        .{ .name = "default", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/nonexistent/fumo-default" } },
+    };
+    var registry = try Registry.initAccounts(std.testing.allocator, std.testing.io, &upstreams, "/nonexistent/fumo-default");
+    defer registry.deinit();
+    try std.testing.expectEqual(2, registry.accounts.len);
+    try std.testing.expectEqualStrings("codex", registry.accounts[0].id);
+    try std.testing.expectEqualStrings("default", registry.accounts[1].id);
+    try std.testing.expect(registry.entries[0].account == registry.entries[1].account);
+    try std.testing.expect(registry.entries[2].account == &registry.accounts[1]);
+    try std.testing.expect(registry.accounts[0].configured);
+    try std.testing.expect(registry.accounts[1].configured);
+}
+
+test "provider registry falls back only without configured Codex upstreams" {
+    const api_key_only = [_]Upstream{
+        .{ .name = "public", .base_url = "http://localhost/v1", .auth = .{ .api_key = "test-key" } },
+    };
+    for ([_][]const Upstream{ &.{}, &api_key_only }) |upstreams| {
+        var registry = try Registry.initAccounts(std.testing.allocator, std.testing.io, upstreams, "/nonexistent/fumo-default");
+        defer registry.deinit();
+        try std.testing.expectEqual(1, registry.accounts.len);
+        try std.testing.expectEqualStrings("codex", registry.accounts[0].id);
+        try std.testing.expect(!registry.accounts[0].configured);
+    }
+}
+
+test "provider registry uses configured codex account instead of default directory" {
+    const upstreams = [_]Upstream{
+        .{ .name = "codex", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/nonexistent/fumo-custom" } },
+    };
+    var registry = try Registry.initAccounts(std.testing.allocator, std.testing.io, &upstreams, "/nonexistent/fumo-default");
+    defer registry.deinit();
+    try std.testing.expectEqual(1, registry.accounts.len);
+    try std.testing.expectEqualStrings("codex", registry.accounts[0].id);
+    try std.testing.expectEqualStrings("/nonexistent/fumo-custom", registry.accounts[0].directory);
+    try std.testing.expect(registry.accounts[0].configured);
+    try std.testing.expect(registry.entries[0].account == &registry.accounts[0]);
 }

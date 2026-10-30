@@ -5,7 +5,8 @@ pub const Upstream = @import("provider.zig").Upstream;
 const Document = struct {
     upstreams: std.json.ArrayHashMap(Upstream.Options) = .{},
     listen: []const u8 = "127.0.0.1:8080",
-    clients: std.json.ArrayHashMap(struct { key_env: []const u8 }),
+    clients: std.json.ArrayHashMap(struct { key_env: []const u8 }) = .{},
+    admin: ?struct { key_env: []const u8 = "FUMO_ADMIN_KEY" } = null,
 };
 
 pub const Config = struct {
@@ -13,6 +14,9 @@ pub const Config = struct {
     address: std.Io.net.IpAddress,
     clients: []const auth.Client,
     upstreams: []const Upstream,
+    admin_client: ?auth.Client = null,
+    admin_key_env: []const u8 = "FUMO_ADMIN_KEY",
+    admin_directory: ?[]const u8 = null,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, environ: *const std.process.Environ.Map) !Config {
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024));
@@ -33,7 +37,17 @@ pub const Config = struct {
 
         const address = std.Io.net.IpAddress.parseLiteral(document.listen) catch return error.InvalidListenAddress;
         if (address.getPort() == 0) return error.InvalidListenAddress;
-        if (document.clients.map.count() == 0) return error.NoClients;
+        const admin_env = if (document.admin) |admin| admin.key_env else "FUMO_ADMIN_KEY";
+        if (!std.process.Environ.Map.validateKeyForPut(admin_env)) return error.InvalidKeyEnv;
+        const admin_key = environ.get(admin_env);
+        if (document.admin != null and admin_key == null) return error.MissingAdminKey;
+        const admin_client: ?auth.Client = if (admin_key) |key| blk: {
+            if (key.len == 0) return error.EmptyAdminKey;
+            for (key) |byte| {
+                if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return error.InvalidAdminKey;
+            }
+            break :blk auth.Client.init("admin", key);
+        } else null;
 
         const clients = try allocator.alloc(auth.Client, document.clients.map.count());
         for (document.clients.map.keys(), document.clients.map.values(), 0..) |label, client, i| {
@@ -47,12 +61,15 @@ pub const Config = struct {
             }
 
             clients[i] = auth.Client.init(label, key);
+            if (admin_client) |admin| {
+                if (std.mem.eql(u8, &admin.key_hash, &clients[i].key_hash)) return error.SharedAdminKey;
+            }
             for (clients[0..i]) |previous| {
                 if (std.mem.eql(u8, &previous.key_hash, &clients[i].key_hash)) return error.DuplicateClientKey;
             }
         }
 
-        return .{ .arena = arena, .address = address, .clients = clients, .upstreams = upstreams };
+        return .{ .arena = arena, .address = address, .clients = clients, .upstreams = upstreams, .admin_client = admin_client, .admin_key_env = admin_env, .admin_directory = if (admin_client != null) try @import("codex/credentials.zig").defaultDirectory(allocator, environ) else null };
     }
 
     pub fn deinit(self: *Config) void {
@@ -89,7 +106,9 @@ test "invalid configuration fails before serving" {
     try environ.put("PI_KEY", "bad\r\nkey");
     try std.testing.expectError(error.InvalidClientKey, Config.parse(std.testing.allocator, text, &environ));
     try environ.put("PI_KEY", "secret");
-    try std.testing.expectError(error.NoClients, Config.parse(std.testing.allocator, "{\"clients\":{}}", &environ));
+    var empty = try Config.parse(std.testing.allocator, "{}", &environ);
+    defer empty.deinit();
+    try std.testing.expectEqual(0, empty.clients.len);
     try std.testing.expectError(error.DuplicateClientKey, Config.parse(std.testing.allocator,
         \\{"clients":{"pi":{"key_env":"PI_KEY"},"dev":{"key_env":"PI_KEY"}}}
     , &environ));
@@ -193,4 +212,23 @@ test "invalid upstream definitions and credentials fail before serving" {
             try std.testing.expectError(error.InvalidUpstreamKey, Config.parse(a, text, &environ));
         }
     }
+}
+
+test "admin defaults disabled and keys cannot grant inference access" {
+    const a = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(a);
+    defer environ.deinit();
+    var disabled = try Config.parse(a, "{}", &environ);
+    defer disabled.deinit();
+    try std.testing.expect(disabled.admin_client == null);
+    try std.testing.expect(disabled.admin_directory == null);
+    try std.testing.expectError(error.MissingAdminKey, Config.parse(a, "{\"admin\":{\"key_env\":\"TYPO\"}}", &environ));
+    try environ.put("HOME", "/home/test");
+    try environ.put("FUMO_ADMIN_KEY", "admin-secret");
+    var onboarding = try Config.parse(a, "{}", &environ);
+    defer onboarding.deinit();
+    try std.testing.expect(onboarding.admin_client != null);
+    try std.testing.expectEqual(0, onboarding.clients.len);
+    try std.testing.expectEqual(0, onboarding.upstreams.len);
+    try std.testing.expectError(error.SharedAdminKey, Config.parse(a, "{\"clients\":{\"bad\":{\"key_env\":\"FUMO_ADMIN_KEY\"}}}", &environ));
 }

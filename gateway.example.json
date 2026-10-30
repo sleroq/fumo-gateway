@@ -1,5 +1,6 @@
 {
     "listen": "127.0.0.1:8080",
+    "admin": { "key_env": "FUMO_ADMIN_KEY" },
     "upstreams": {
         "codex": {
             "base_url": "https://api.openai.com/v1",
