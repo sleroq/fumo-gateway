@@ -166,7 +166,6 @@ pub const Refresh = struct {
             else => return err,
         };
         return try task.await(io);
-
     }
 
     /// allocator is the exchange caller's arena for credentials and intermediates.

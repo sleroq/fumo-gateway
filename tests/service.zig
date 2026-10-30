@@ -18,7 +18,7 @@ const Storage = struct {
     path: [:0]u8,
 
     fn init(lifetime: i64) !Storage {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
         errdefer tmp.cleanup();
         try tmp.dir.setPermissions(io, .fromMode(0o700));
         const path = try tmp.dir.realPathFileAlloc(io, ".", a);

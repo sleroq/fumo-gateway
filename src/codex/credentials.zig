@@ -147,7 +147,7 @@ test "saved contents are trusted without semantic or size validation" {
 test "current flat SIWC records retain registration without usable tokens" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.setPermissions(io, .fromMode(0o700));
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
@@ -170,7 +170,7 @@ test "current flat SIWC records retain registration without usable tokens" {
 test "pre-SIWC records without registration metadata cannot be loaded" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.setPermissions(io, .fromMode(0o700));
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);

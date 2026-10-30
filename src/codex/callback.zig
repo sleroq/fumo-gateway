@@ -6,15 +6,29 @@ pub const Callback = struct {
     server: std.Io.net.Server,
 
     pub fn listen(io: std.Io, port: u16) !Callback {
-        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-        var server = try address.listen(io, .{ .reuse_address = true });
+        const posix = std.posix;
+        const handle: posix.fd_t = @intCast(try socketResult(posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP)));
+        var server: std.Io.net.Server = .{
+            .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(port) } },
+            .options = {},
+        };
         errdefer server.deinit(io);
-        // std.Io enables both reuse options. Keep REUSEADDR for immediate
-        // retries after TIME_WAIT, but never share an active callback port.
-        if (@hasDecl(std.posix.SO, "REUSEPORT")) {
-            const disabled: c_int = 0;
-            try std.posix.setsockopt(server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&disabled));
-        }
+        _ = try socketResult(posix.system.fcntl(handle, posix.F.SETFD, @as(u32, posix.FD_CLOEXEC)));
+
+        // std.Io's reuse_address also enables REUSEPORT. On Linux disabling it
+        // after listen leaves the socket in its reuse-port group. Set only
+        // REUSEADDR before bind so retries work without sharing an active port.
+        const enabled: c_int = 1;
+        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enabled));
+        var address: posix.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        };
+        _ = try socketResult(posix.system.bind(handle, @ptrCast(&address), @sizeOf(@TypeOf(address))));
+        _ = try socketResult(posix.system.listen(handle, std.Io.net.default_kernel_backlog));
+        var address_len: posix.socklen_t = @sizeOf(@TypeOf(address));
+        _ = try socketResult(posix.system.getsockname(handle, @ptrCast(&address), &address_len));
+        server.socket.address.setPort(std.mem.bigToNative(u16, address.port));
         return .{ .server = server };
     }
 
@@ -82,6 +96,15 @@ pub const Callback = struct {
         }
     }
 };
+
+fn socketResult(result: anytype) !@TypeOf(result) {
+    return switch (std.posix.errno(result)) {
+        .SUCCESS => result,
+        .ADDRINUSE => error.AddressInUse,
+        .ACCES => error.AccessDenied,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
+}
 
 fn respond(request: *std.http.Server.Request, writer: *std.Io.net.Stream.Writer, status: std.http.Status, body: []const u8) std.Io.Cancelable!void {
     request.respond(body, .{

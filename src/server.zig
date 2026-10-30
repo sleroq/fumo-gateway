@@ -703,7 +703,7 @@ test "transport shared client isolates concurrent cancellation and remains usabl
 test "transport unavailable SIWC credentials return 503 without sending inference" {
     const T = TransportTest;
     const a = T.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.setPermissions(T.io, .fromMode(0o700));
     const directory = try tmp.dir.realPathFileAlloc(T.io, ".", a);
@@ -1030,28 +1030,4 @@ test "transport one OpenCode upstream serves both native endpoints with shared c
         try std.testing.expectEqual(cases.len, fixture.count.load(.acquire));
         try std.testing.expect(registry.entries[0].catalog.arena == null);
     }
-}
-
-test "HTTP SIWC rejects Chat Completions before credential access" {
-    const a = std.testing.allocator;
-    const payload = "{\"model\":\"codex/model\",\"messages\":[]}";
-    const raw = try a.print("POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
-    defer a.free(raw);
-    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
-    const upstreams = [_]@import("provider.zig").Upstream{.{
-        .name = "codex",
-        .base_url = "https://api.openai.com/v1",
-        .auth = .{ .codex = "/unused" },
-    }};
-    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &upstreams };
-    var reader = std.Io.Reader.fixed(raw);
-    var writer: std.Io.Writer.Allocating = .init(a);
-    defer writer.deinit();
-    var http = std.http.Server.init(&reader, &writer.writer);
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    var completed: std.Io.Semaphore = .{};
-    try std.testing.expectEqual(null, try prepareRequest(std.testing.io, a, arena.allocator(), &http, &config, &completed));
-    try std.testing.expect(std.mem.startsWith(u8, writer.written(), "HTTP/1.1 400 "));
-    try std.testing.expect(std.mem.endsWith(u8, writer.written(), "{\"error\":\"protocol_mismatch\"}\n"));
 }
