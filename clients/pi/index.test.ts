@@ -217,7 +217,7 @@ async function nativeRequest(runtime: ModelRuntime, id: string, cacheRetention: 
   return { request: requests[0], payload };
 }
 
-test("constrained native Responses keeps full IDs, tools, effort updates, and explicit cache mode", async () => {
+test("constrained native Responses keeps full IDs, tools, top-level effort, and explicit cache mode", async () => {
   const { runtime } = await discover("https://gateway.example.test/v1");
   const { request, payload } = await nativeRequest(runtime, "personal/gpt-6.1-sol");
   expect(request.url).toBe("https://gateway.example.test/v1/responses");
@@ -229,8 +229,8 @@ test("constrained native Responses keeps full IDs, tools, effort updates, and ex
     type: "additional_tools", role: "developer", tools: [expect.objectContaining({ name: "fixture_read", type: "function" })],
   }));
   expect(payload.input.some((item: { type?: string }) => item.type?.startsWith("tool_search"))).toBe(false);
-  expect(payload.input).toContainEqual({ type: "configuration_update", reasoning: { effort: "high" } });
-  expect(payload.reasoning.effort).toBe("medium");
+  expect(payload.input.some((item: { type?: string }) => item.type === "configuration_update")).toBe(false);
+  expect(payload.reasoning.effort).toBe("high");
   expect((await nativeRequest(runtime, "personal/gpt-6.1-sol", "none")).payload.prompt_cache_options).toEqual({ mode: "explicit" });
 
   const alias = (await nativeRequest(runtime, "personal/fast")).payload;

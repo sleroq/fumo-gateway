@@ -41,6 +41,8 @@ export function toPiModel(entry: CatalogEntry, baseUrl: string): Model<"openai-r
     // Pi needs both flags to place function tools in native additional_tools items.
     compat.supportsAdditionalTools = true;
     compat.supportsMidConvoSystemMessages = true;
+    // SIWC rejects configuration_update input items even when the native model supports them.
+    compat.supportsMidConvoEffort = false;
     if (metadata.constraints.unsupported_tools.includes("tool_search")) compat.supportsToolSearch = false;
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "@fumo-gateway/pi",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Fumo gateway model discovery for Pi's native OpenAI adapters",
   "type": "module",
   "keywords": ["pi-package", "fumo"],
