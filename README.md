@@ -33,6 +33,41 @@ nix run github:sleroq/fumo-gateway
 
 For NixOS, use the [included module](nix/README.md).
 
+## Client plugins
+
+The plugins discover available models and configure native adapters from Fumo's
+metadata, including Sign in with ChatGPT request restrictions. They are optional:
+any OpenAI-compatible client can use the gateway URL and client API key directly,
+with model IDs and request options configured manually.
+
+Authenticate with a **gateway client API key** (`FUMO_PI_KEY` in the quick start), not the admin key or upstream tokens.
+
+### Pi
+
+```sh
+pi install npm:@fumo-gateway/pi
+pi
+```
+
+Run `/login fumo`, enter the gateway URL (including `/v1`) and client key.
+
+### OpenCode
+
+Add to `opencode.json`:
+
+```json
+{
+  "plugins": [{
+    "package": "@fumo-gateway/opencode",
+    "options": { "baseURL": "http://localhost:8080/v1" }
+  }]
+}
+```
+
+Restart OpenCode, run `/connect`, choose **Fumo Gateway**, and enter the client key.
+Select a model with `/models`. Models refresh at startup and on account switches;
+restart OpenCode to retry discovery or pick up gateway catalog changes.
+
 ## Development
 
 Run `zig build test`, `zig build test-auth`, and `zig build test-service`.

@@ -2,6 +2,10 @@
 .zig-cache/
 zig-out/
 web/node_modules/
+clients/node_modules/
+clients/**/node_modules/
+clients/**/dist/
+clients/opencode/server.js
 web/dist/
 web/test-results/
 web/playwright-report/

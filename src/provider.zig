@@ -227,7 +227,12 @@ pub const Registry = struct {
     pub fn modelList(self: *Registry, client: *std.http.Client, arena_allocator: std.mem.Allocator) ![]const u8 {
         var list: std.ArrayList(models.Model) = .empty;
         var available = self.entries.len == 0;
-        for (self.entries) |*entry| available = try entry.appendModels(client, arena_allocator, &list) or available;
+        for (self.entries) |*entry| {
+            const start = list.items.len;
+            available = try entry.appendModels(client, arena_allocator, &list) or available;
+            for (list.items[start..]) |*model|
+                model.request_constraints = if (entry.upstream.auth == .codex) models.RequestConstraints.codex else null;
+        }
         if (!available) return error.ModelDiscoveryUnavailable;
 
         // An alias may shadow a discovered name. Advertise it only once.
@@ -339,6 +344,68 @@ test "provider catalog aliases inherit only discovered target metadata" {
         try std.testing.expectEqualStrings("test/vendor/native", data[4].object.get("id").?.string);
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
+}
+
+test "provider serialized catalog fixture binds constraints to auth including aliases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const siwc =
+        \\{"models":[{"slug":"gpt-6.1-sol","display_name":"Personal Codex","visibility":"list","context_window":272000,"max_output_tokens":16000,"input_modalities":["text","image"],"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high","description":"Thorough"}],"supports_parallel_tool_calls":false,"request_constraints":{"spoofed":true}}]}
+    ;
+    const api_key =
+        \\{"data":[{"id":"gpt-6.1-sol","name":"API-key model","created":23,"context_length":128000,"api":"openai-responses","request_constraints":{"responses":{"required":{"store":true}}}}]}
+    ;
+    const rich =
+        \\{"data":[{"id":"vendor/rich","name":"Rich chat model","created":42,"context_length":200000,"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"top_provider":{"max_completion_tokens":32000},"supported_parameters":["reasoning","tools"],"reasoning":{"efforts":["low","high"]},"api":"openai-completions","extra":{"enabled":false,"nullable":null,"price":0.1234567890123456789,"precise":18446744073709551617}}]}
+    ;
+    const Fixture = @import("fixture").Fixture;
+    var fixture = try Fixture.init(a, io, &.{
+        .{ .bytes = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ siwc.len, siwc }) },
+        .{ .bytes = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ api_key.len, api_key }) },
+        .{ .bytes = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ rich.len, rich }) },
+    });
+    defer fixture.deinit();
+    try fixture.start();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const origin = try fixture.origin(ra);
+    var upstreams = [_]Upstream{
+        .{ .name = "personal", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/nonexistent/fumo-catalog-fixture" } },
+        .{ .name = "codex", .base_url = origin, .auth = .{ .api_key = "fixture-key" } },
+        .{ .name = "zen", .base_url = origin },
+    };
+    try upstreams[0].aliases.map.put(ra, "fast", "gpt-6.1-sol");
+    try upstreams[0].aliases.map.put(ra, "future", "unlisted");
+    try upstreams[1].aliases.map.put(ra, "quick", "gpt-6.1-sol");
+    try upstreams[1].aliases.map.put(ra, "future", "unlisted");
+    var registry = try Registry.init(a, io, &upstreams);
+    defer registry.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+
+    // Prewarm SIWC via a local server, without bypassing the real endpoint pin
+    // or loading private credentials. Registry reads this same cached snapshot.
+    var scratch: std.ArrayList(models.Model) = .empty;
+    const catalog = &registry.entries[0].catalog;
+    try std.testing.expect(try catalog.append(&client, ra, .{ .url = origin, .namespace = "personal", .format = .siwc }, &scratch));
+    const expected = try std.Io.Dir.cwd().readFileAlloc(io, "tests/fixtures/model-catalog.json", ra, .limited(64 * 1024));
+    for (0..2) |_| {
+        const serialized = try registry.modelList(&client, ra);
+        try std.testing.expectEqualStrings(expected, serialized);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ra, serialized, .{});
+        const data = parsed.object.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 7), data.len);
+        for (data, 0..) |model, index| {
+            try std.testing.expectEqual(index < 3, model.object.contains("request_constraints"));
+        }
+        try std.testing.expectEqualStrings("personal/future", data[1].object.get("id").?.string);
+        try std.testing.expect(!data[1].object.contains("context_window"));
+        try std.testing.expect(!data[2].object.contains("api"));
+        try std.testing.expectEqualStrings("codex/future", data[4].object.get("id").?.string);
+        try std.testing.expectEqual(@as(usize, 3), data[4].object.count());
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.count.load(.acquire));
 }
 
 test "provider Responses header allowlist excludes credentials and transport-owned headers" {

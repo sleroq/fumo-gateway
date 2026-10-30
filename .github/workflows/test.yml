@@ -26,6 +26,12 @@ jobs:
             - name: Check configuration schema
               run: nix develop --command bun run --cwd web test:schema
 
+            - name: Test native client discovery and transports
+              run: |
+                  nix develop --command bun install --cwd clients --frozen-lockfile --ignore-scripts
+                  nix develop --command bun run --cwd clients typecheck
+                  nix develop --command bun run --cwd clients test
+
             - name: Run browser smoke test
               run: |
                   cd web

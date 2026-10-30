@@ -15,12 +15,30 @@ pub const Source = struct {
     format: Format = .openai,
 };
 
+/// Gateway-owned HTTP Responses policy, independent of native model metadata.
+pub const RequestConstraints = struct {
+    responses: struct {
+        omit: []const []const u8,
+        function_tools: []const u8,
+        unsupported_tools: []const []const u8,
+    },
+
+    // https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations
+    pub const codex: RequestConstraints = .{ .responses = .{
+        .omit = &.{ "background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id" },
+        .function_tools = "namespaced-or-additional",
+        .unsupported_tools = &.{ "image_generation", "file_search", "code_interpreter", "computer_use_preview", "mcp", "tool_search", "programmatic_tool_calling" },
+    } };
+};
+
 pub const Model = struct {
     name: ?[]const u8 = null,
     id: []const u8,
     object: []const u8 = "model",
     created: ?i64 = null,
     owned_by: []const u8,
+    /// Omitted means unknown/no gateway policy, not unrestricted support.
+    request_constraints: ?RequestConstraints = null,
     /// Native discovery extensions, emitted at the catalog entry's top level.
     metadata: std.json.ObjectMap = .empty,
 
@@ -39,6 +57,10 @@ pub const Model = struct {
         if (self.created) |created| {
             try writer.objectField("created");
             try writer.write(created);
+        }
+        if (self.request_constraints) |constraints| {
+            try writer.objectField("request_constraints");
+            try writer.write(constraints);
         }
         var fields = self.metadata.iterator();
         while (fields.next()) |field| {
@@ -200,7 +222,7 @@ pub const Cache = struct {
             };
             if (entry.id.len == 0) return error.EmptyModelId;
             var metadata = value.object;
-            for ([_][]const u8{ "id", "object", "owned_by", "name", "created" }) |field| _ = metadata.orderedRemove(field);
+            for ([_][]const u8{ "id", "object", "owned_by", "name", "created", "request_constraints" }) |field| _ = metadata.orderedRemove(field);
             try result.append(allocator, .{
                 .id = try allocator.print("{s}/{s}", .{ source.namespace, entry.id }),
                 .created = entry.created,
