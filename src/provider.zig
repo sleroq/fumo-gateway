@@ -17,26 +17,17 @@ pub const Protocol = enum {
             .chat_completions => "/chat/completions",
         };
     }
-
-    pub fn api(self: Protocol) []const u8 {
-        return switch (self) {
-            .responses => "openai-responses",
-            .chat_completions => "openai-completions",
-        };
-    }
 };
 
 /// Immutable, config-arena-owned definition. Runtime state lives in Provider.
 pub const Upstream = struct {
     name: []const u8,
     base_url: []const u8,
-    protocol: Protocol = .responses,
     aliases: std.json.ArrayHashMap([]const u8) = .{},
     auth: union(enum) { none, codex: []const u8, api_key: []const u8 } = .none,
 
     pub const Options = struct {
         base_url: []const u8,
-        protocol: Protocol = .responses,
         aliases: std.json.ArrayHashMap([]const u8) = .{},
         auth: ?struct {
             provider: enum { codex, api_key },
@@ -56,7 +47,7 @@ pub const Upstream = struct {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidUpstreamUrl;
         const host = uri.host orelse return error.InvalidUpstreamUrl;
         if (host.isEmpty() or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or uri.port == 0) return error.InvalidUpstreamUrl;
-        var result: Upstream = .{ .name = name, .base_url = base_url, .protocol = options.protocol, .aliases = options.aliases };
+        var result: Upstream = .{ .name = name, .base_url = base_url, .aliases = options.aliases };
 
         if (options.auth) |auth| switch (auth.provider) {
             .codex => {
@@ -89,7 +80,7 @@ pub const Upstream = struct {
 
     fn validateEndpoint(self: Upstream) !void {
         // SIWC direct-token credentials must never reach a configurable host.
-        if (self.auth == .codex and (!std.mem.eql(u8, self.base_url, "https://api.openai.com/v1") or self.protocol != .responses)) return error.InvalidCodexEndpoint;
+        if (self.auth == .codex and !std.mem.eql(u8, self.base_url, "https://api.openai.com/v1")) return error.InvalidCodexEndpoint;
     }
 
     pub fn requiredHeaders(self: Upstream) []const std.http.Header {
@@ -135,7 +126,6 @@ pub const Provider = struct {
             try list.append(arena_allocator, .{
                 .id = try arena_allocator.print("{s}/{s}", .{ upstream.name, alias }),
                 .owned_by = upstream.name,
-                .api = upstream.protocol.api(),
             });
         }
 
@@ -144,7 +134,6 @@ pub const Provider = struct {
             .authorization = self.authorization(arena_allocator),
             .headers = upstream.requiredHeaders(),
             .namespace = upstream.name,
-            .api = upstream.protocol.api(),
             .format = if (upstream.auth == .codex) .siwc else .openai,
         }, list);
 
@@ -207,8 +196,8 @@ pub fn allowsRequestHeader(name: []const u8) bool {
 
 pub const Routed = struct { upstream: usize, body: []u8 };
 
-/// Discovery is not an allowlist. Only the namespace, optional alias, and native
-/// protocol are resolved locally. Scratch is freed before the request is relayed.
+/// Discovery is not an allowlist. Resolve the namespace and optional alias;
+/// the incoming endpoint selects the protocol. Scratch is freed before relay.
 pub fn rewriteRequest(gpa: std.mem.Allocator, allocator: std.mem.Allocator, body: []const u8, upstreams: []const Upstream, protocol: Protocol) !Routed {
     try validateRequestDepth(gpa, body);
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .parse_numbers = false }) catch |err| switch (err) {
@@ -216,20 +205,24 @@ pub fn rewriteRequest(gpa: std.mem.Allocator, allocator: std.mem.Allocator, body
         else => return error.InvalidRequest,
     };
     defer parsed.deinit();
+
     var value = parsed.value;
     if (value != .object) return error.InvalidRequest;
     const model = value.object.getPtr("model") orelse return error.InvalidRequest;
     if (model.* != .string) return error.InvalidRequest;
+
     const separator = std.mem.findScalar(u8, model.string, '/') orelse return error.UnknownUpstream;
     const name = model.string[0..separator];
     const native = model.string[separator + 1 ..];
     if (native.len == 0) return error.InvalidRequest;
+
     for (upstreams, 0..) |upstream, index| {
         if (!std.mem.eql(u8, upstream.name, name)) continue;
-        if (upstream.protocol != protocol) return error.ProtocolMismatch;
+        if (upstream.auth == .codex and protocol != .responses) return error.ProtocolMismatch;
         model.* = .{ .string = upstream.aliases.map.get(native) orelse native };
         return .{ .upstream = index, .body = try std.json.Stringify.valueAlloc(allocator, value, .{}) };
     }
+
     return error.UnknownUpstream;
 }
 
@@ -260,8 +253,8 @@ test "provider Responses header allowlist excludes credentials and transport-own
 test "provider routing preserves native fields and resolves only the namespace and alias" {
     const a = std.testing.allocator;
     var upstreams = [_]Upstream{
-        .{ .name = "codex", .base_url = "https://api.openai.com/v1" },
-        .{ .name = "zen", .base_url = "https://example.com/v1", .protocol = .chat_completions },
+        .{ .name = "codex", .base_url = "https://api.openai.com/v1", .auth = .{ .codex = "/unused" } },
+        .{ .name = "zen", .base_url = "https://example.com/v1", .auth = .{ .api_key = "zen-secret" } },
     };
     defer upstreams[0].aliases.deinit(a);
     try upstreams[0].aliases.map.put(a, "fast", "upstream-model");
@@ -289,7 +282,11 @@ test "provider routing preserves native fields and resolves only the namespace a
     try std.testing.expectEqualStrings("{\"model\":\"vendor/new-model\",\"messages\":[]}", direct.body);
     try std.testing.expectError(error.UnknownUpstream, rewriteRequest(a, a, "{\"model\":\"missing/model\"}", &upstreams, .responses));
     try std.testing.expectError(error.UnknownUpstream, rewriteRequest(a, a, "{\"model\":\"unqualified\"}", &upstreams, .responses));
-    try std.testing.expectError(error.ProtocolMismatch, rewriteRequest(a, a, "{\"model\":\"zen/model\"}", &upstreams, .responses));
+    const responses = try rewriteRequest(a, a, "{\"model\":\"zen/vendor/another-model\",\"input\":[]}", &upstreams, .responses);
+    defer a.free(responses.body);
+    try std.testing.expectEqual(1, responses.upstream);
+    try std.testing.expectEqualStrings("{\"model\":\"vendor/another-model\",\"input\":[]}", responses.body);
+    try std.testing.expectError(error.ProtocolMismatch, rewriteRequest(a, a, "{\"model\":\"codex/model\",\"messages\":[]}", &upstreams, .chat_completions));
     for ([_][]const u8{ "invalid", "[]", "{}", "{\"model\":1}", "{\"model\":\"codex/\"}" }) |invalid| {
         try std.testing.expectError(error.InvalidRequest, rewriteRequest(a, a, invalid, &upstreams, .responses));
     }

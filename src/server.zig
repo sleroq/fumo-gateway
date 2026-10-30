@@ -213,6 +213,8 @@ test "HTTP health, authentication, and routing" {
         .{ "POST /v1/responses HTTP/1.1\r\nExpect: unsupported\r\n\r\n", "401 Unauthorized", "unauthorized" },
         .{ "POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer first-secret\r\nContent-Length: 2\r\n\r\n{}", "400 Bad Request", "invalid_request" },
         .{ "POST /v1/models HTTP/1.1\r\nAuthorization: Bearer first-secret\r\n\r\n", "404 Not Found", "not_found" },
+        .{ "POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer first-secret\r\n\r\n", "404 Not Found", "not_found" },
+        .{ "POST /v1/models/model:generateContent HTTP/1.1\r\nAuthorization: Bearer first-secret\r\n\r\n", "404 Not Found", "not_found" },
         .{ "GET /unknown?limit=1 HTTP/1.1\r\naUtHoRiZaTiOn: bearer second-secret\r\n\r\n", "404 Not Found", "not_found" },
         .{ "GET /v1 HTTP/1.1\r\n\r\n", "401 Unauthorized", "unauthorized" },
         .{ "GET /unknown HTTP/1.1\r\n\r\n", "404 Not Found", "not_found" },
@@ -829,7 +831,7 @@ test "transport models aggregate namespaces aliases and cached metadata while in
     const ra = arena.allocator();
     var upstreams = [_]@import("provider.zig").Upstream{
         .{ .name = "responses", .base_url = try ra.print("{s}/v1", .{try responses_fixture.origin(ra)}), .auth = .{ .api_key = "responses-secret" } },
-        .{ .name = "chat", .base_url = try ra.print("{s}/v1", .{try chat_fixture.origin(ra)}), .protocol = .chat_completions, .auth = .{ .api_key = "chat-secret" } },
+        .{ .name = "chat", .base_url = try ra.print("{s}/v1", .{try chat_fixture.origin(ra)}), .auth = .{ .api_key = "chat-secret" } },
     };
     try upstreams[0].aliases.map.put(ra, "shared", "aliased-native");
     const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
@@ -858,7 +860,7 @@ test "transport models aggregate namespaces aliases and cached metadata while in
         try std.testing.expectEqualStrings("responses/shared", data[0].object.get("id").?.string);
         try std.testing.expectEqualStrings("responses/vendor/new-model", data[1].object.get("id").?.string);
         try std.testing.expectEqualStrings("chat/shared", data[2].object.get("id").?.string);
-        try std.testing.expectEqualStrings("openai-completions", data[2].object.get("api").?.string);
+        for (data) |model| try std.testing.expect(!model.object.contains("api"));
         try std.testing.expectEqual(@as(i64, 42), data[2].object.get("created").?.integer);
         try std.testing.expect(std.mem.find(u8, raw, "secret") == null);
         try std.testing.expectEqual(1, responses_fixture.count.load(.acquire));
@@ -974,4 +976,83 @@ test "transport models keep healthy upstreams when another discovery fails" {
     const data = parsed.value.object.get("data").?.array.items;
     try std.testing.expectEqual(1, data.len);
     try std.testing.expectEqualStrings("healthy/model", data[0].object.get("id").?.string);
+}
+
+test "transport one OpenCode upstream serves both native endpoints with shared credentials and no discovery" {
+    const T = TransportTest;
+    const a = T.allocator;
+    const plain = "{\"ok\":true}";
+    const sse = "data: {\"delta\":\"native\"}\n\n";
+    const plain_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ plain.len, plain });
+    const sse_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ sse.len, sse });
+    const cases = [_]struct { path: []const u8, fields: []const u8, reply: []const u8, response: []const u8 }{
+        .{ .path = "/responses", .fields = ",\"input\":[],\"stream\":false,\"reasoning\":{\"effort\":\"high\"}}", .reply = plain_reply, .response = plain },
+        .{ .path = "/chat/completions", .fields = ",\"messages\":[],\"stream\":true,\"tools\":[]}", .reply = sse_reply, .response = sse },
+        .{ .path = "/responses", .fields = ",\"input\":[],\"stream\":true,\"tools\":[]}", .reply = sse_reply, .response = sse },
+        .{ .path = "/chat/completions", .fields = ",\"messages\":[],\"stream\":false,\"temperature\":0.5}", .reply = plain_reply, .response = plain },
+    };
+    for ([_][]const u8{ "go", "zen" }) |name| {
+        const prefix = if (std.mem.eql(u8, name, "go")) "/zen/go/v1" else "/zen/v1";
+        var replies: [cases.len]T.fixture.Reply = undefined;
+        for (&replies, cases) |*reply, case| reply.* = .{ .bytes = case.reply };
+        var fixture = try T.fixture.Fixture.init(a, T.io, &replies);
+        defer fixture.deinit();
+        try fixture.start();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ra = arena.allocator();
+        const upstreams = [_]@import("provider.zig").Upstream{.{
+            .name = name,
+            .base_url = try ra.print("{s}{s}", .{ try fixture.origin(ra), prefix }),
+            .auth = .{ .api_key = "opencode-secret" },
+        }};
+        const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+        const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &upstreams };
+        var registry = try Registry.init(a, T.io, config.upstreams);
+        defer registry.deinit();
+        var client: std.http.Client = .{ .allocator = a, .io = T.io };
+        defer client.deinit();
+        for (cases, 0..) |case, index| {
+            const payload = try ra.print("{{\"model\":\"{s}/vendor/new-model\"{s}", .{ name, case.fields });
+            const request = try ra.print("POST /v1{s} HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.path, payload.len, payload });
+            const result = try T.exchange(&client, &config, &registry, request);
+            defer a.free(result);
+            try std.testing.expect(std.mem.startsWith(u8, result, "HTTP/1.1 200 "));
+            try std.testing.expect(std.mem.endsWith(u8, result, case.response));
+            try fixture.waitRequest();
+            const captured = fixture.requests[index].?;
+            try std.testing.expect(std.mem.startsWith(u8, captured, try ra.print("POST {s}{s} HTTP/1.1\r\n", .{ prefix, case.path })));
+            const expected_body = try ra.print("{{\"model\":\"vendor/new-model\"{s}", .{case.fields});
+            try std.testing.expectEqualStrings(expected_body, captured[std.mem.find(u8, captured, "\r\n\r\n").? + 4 ..]);
+            try std.testing.expect(std.mem.find(u8, captured, "Bearer opencode-secret") != null);
+            try std.testing.expect(std.mem.find(u8, captured, "transport-secret") == null);
+        }
+        try std.testing.expectEqual(1, registry.entries.len);
+        try std.testing.expectEqual(cases.len, fixture.count.load(.acquire));
+        try std.testing.expect(registry.entries[0].catalog.arena == null);
+    }
+}
+
+test "HTTP SIWC rejects Chat Completions before credential access" {
+    const a = std.testing.allocator;
+    const payload = "{\"model\":\"codex/model\",\"messages\":[]}";
+    const raw = try a.print("POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer transport-secret\r\nContent-Length: {d}\r\n\r\n{s}", .{ payload.len, payload });
+    defer a.free(raw);
+    const clients = [_]auth.Client{auth.Client.init("transport", "transport-secret")};
+    const upstreams = [_]@import("provider.zig").Upstream{.{
+        .name = "codex",
+        .base_url = "https://api.openai.com/v1",
+        .auth = .{ .codex = "/unused" },
+    }};
+    const config: Config = .{ .arena = undefined, .address = undefined, .clients = &clients, .upstreams = &upstreams };
+    var reader = std.Io.Reader.fixed(raw);
+    var writer: std.Io.Writer.Allocating = .init(a);
+    defer writer.deinit();
+    var http = std.http.Server.init(&reader, &writer.writer);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var completed: std.Io.Semaphore = .{};
+    try std.testing.expectEqual(null, try prepareRequest(std.testing.io, a, arena.allocator(), &http, &config, &completed));
+    try std.testing.expect(std.mem.startsWith(u8, writer.written(), "HTTP/1.1 400 "));
+    try std.testing.expect(std.mem.endsWith(u8, writer.written(), "{\"error\":\"protocol_mismatch\"}\n"));
 }

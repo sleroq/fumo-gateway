@@ -15,7 +15,7 @@
 - No server-side agent loop or tool execution.
 
 ### Configuration and access
-- Declarative configuration for named upstreams, native protocols, optional model aliases, client keys, and outbound proxies.
+- Declarative configuration for named upstreams, optional model aliases, client keys, and outbound proxies.
 - Namespaced model routing without a gateway-maintained allowlist; aggregate provider discovery through authenticated `/v1/models` with lazy in-memory caching.
 - Secrets supplied separately from configuration.
 - Configuration changes take effect on restart; OAuth credentials and ephemeral discovery caches are the only mutable provider state.
@@ -45,14 +45,14 @@ Universal protocol translation, WebSockets, automatic model-family guessing, acc
 ## Implemented foundation
 
 - Named upstreams with SIWC or environment-backed bearer API keys.
-- Native Responses and Chat Completions relay with namespace/alias resolution, streaming, cancellation, and shared outbound pooling.
+- Native Responses and Chat Completions relay selected by the incoming endpoint under the same upstream, with namespace/alias resolution, streaming, cancellation, and shared outbound pooling. Codex remains Responses-only.
 - Authenticated OpenAI-compatible `/v1/models`: SIWC and standard catalog normalization, lazy per-provider cache, stale/partial results, and optional aliases. Discovery never gates inference.
 - Fixture coverage for routing, credential isolation, cache lifetime/refresh, and transport behavior. Live Pi/OpenCode acceptance is still required.
 
 ## Current limitations
 
 - Outbound proxies and Prometheus metrics are not implemented yet.
-- Protocol is configured per upstream; mixed-protocol catalogs are not classified by model family. Anthropic Messages is not supported.
+- Model catalogs are unfiltered and do not assign protocols; clients select the native API. Anthropic Messages and Google-native protocols are not supported.
 - Pi/OpenCode custom-provider model pickers still need client configuration or a discovery integration; `/v1/models` alone does not install models into those clients.
 
 - Concurrency is implemented via worker threads and std.Id.Threaded. With SSE this will likely cause a lot of workers to be waiting for idle SSE connections and needs to be fixed in the future

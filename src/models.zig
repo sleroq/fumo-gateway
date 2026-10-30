@@ -12,7 +12,6 @@ pub const Source = struct {
     authorization: anyerror!?[]const u8 = null,
     headers: []const std.http.Header = &.{},
     namespace: []const u8,
-    api: []const u8,
     format: Format = .openai,
 };
 
@@ -22,7 +21,6 @@ pub const Model = struct {
     object: []const u8 = "model",
     created: i64 = 0,
     owned_by: []const u8,
-    api: []const u8,
 };
 
 /// Service-owned snapshot. Keep at a stable address and join discovery callers
@@ -80,7 +78,6 @@ pub const Cache = struct {
                 .object = try request_allocator.dupe(u8, model.object),
                 .created = model.created,
                 .owned_by = try request_allocator.dupe(u8, model.owned_by),
-                .api = try request_allocator.dupe(u8, model.api),
             });
         }
         return true;
@@ -151,7 +148,6 @@ pub const Cache = struct {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         var result: std.ArrayList(Model) = .empty;
         const owner = try allocator.dupe(u8, source.namespace);
-        const protocol = try allocator.dupe(u8, source.api);
         for (entries) |entry| {
             if (entry.id.len == 0) return error.EmptyModelId;
             const slot = try seen.getOrPut(allocator, entry.id);
@@ -161,7 +157,6 @@ pub const Cache = struct {
                 .created = entry.created,
                 .name = entry.name,
                 .owned_by = owner,
-                .api = protocol,
             });
         }
         return result.items;
@@ -200,7 +195,7 @@ test "models fetch authorization nested IDs TTL refresh and stale snapshot" {
     var cache: Cache = .{ .allocator = a };
     defer cache.deinit();
     var output: std.ArrayList(Model) = .empty;
-    try std.testing.expect(try cache.append(&client, ra, .{ .url = url, .authorization = "Bearer secret", .headers = &.{.{ .name = "x-test", .value = "yes" }}, .namespace = "provider", .api = "openai-responses", .format = .openai }, &output));
+    try std.testing.expect(try cache.append(&client, ra, .{ .url = url, .authorization = "Bearer secret", .headers = &.{.{ .name = "x-test", .value = "yes" }}, .namespace = "provider", .format = .openai }, &output));
     try fixture.waitRequest();
     try std.testing.expectEqual(@as(usize, 1), output.items.len);
     try std.testing.expectEqualStrings("provider/org/model", output.items[0].id);
@@ -208,16 +203,16 @@ test "models fetch authorization nested IDs TTL refresh and stale snapshot" {
     try std.testing.expect(std.mem.containsAtLeast(u8, fixture.requests[0].?, 1, "GET /prefix/models "));
     try std.testing.expect(std.mem.containsAtLeast(u8, fixture.requests[0].?, 1, "Bearer secret"));
     var cached: std.ArrayList(Model) = .empty;
-    _ = try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .api = "openai-responses", .format = .openai }, &cached);
+    _ = try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .format = .openai }, &cached);
     try std.testing.expectEqual(@as(usize, 1), fixture.count.load(.acquire));
     cache.next_refresh = 0;
     cached.clearRetainingCapacity();
-    _ = try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .api = "openai-responses", .format = .openai }, &cached);
+    _ = try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .format = .openai }, &cached);
     try std.testing.expectEqualStrings("provider/replacement", cached.items[0].id);
     try std.testing.expectEqualStrings("provider/org/model", output.items[0].id);
     cache.next_refresh = 0;
     cached.clearRetainingCapacity();
-    try std.testing.expect(try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .api = "openai-responses", .format = .openai }, &cached));
+    try std.testing.expect(try cache.append(&client, ra, .{ .url = url, .authorization = null, .headers = &.{}, .namespace = "provider", .format = .openai }, &cached));
     try std.testing.expectEqualStrings("provider/replacement", cached.items[0].id);
 }
 
@@ -238,7 +233,7 @@ test "models malformed response is not cached and timeout joins socket task" {
         var cache: Cache = .{ .allocator = a, .timeout = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
         defer cache.deinit();
         var output: std.ArrayList(Model) = .empty;
-        try std.testing.expect(!try cache.append(&client, ra, .{ .url = try fixture.origin(ra), .authorization = null, .headers = &.{}, .namespace = "provider", .api = "openai-completions", .format = .openai }, &output));
+        try std.testing.expect(!try cache.append(&client, ra, .{ .url = try fixture.origin(ra), .authorization = null, .headers = &.{}, .namespace = "provider", .format = .openai }, &output));
         try std.testing.expect(cache.arena == null);
         try std.testing.expectEqual(@as(usize, 0), output.items.len);
     }
@@ -260,7 +255,7 @@ test "models SIWC lists visible slugs and labels in server order" {
     var cache: Cache = .{ .allocator = a };
     defer cache.deinit();
     var output: std.ArrayList(Model) = .empty;
-    try std.testing.expect(try cache.append(&client, ra, .{ .url = try fixture.origin(ra), .authorization = "Bearer token", .headers = &.{}, .namespace = "codex", .api = "openai-responses", .format = .siwc }, &output));
+    try std.testing.expect(try cache.append(&client, ra, .{ .url = try fixture.origin(ra), .authorization = "Bearer token", .headers = &.{}, .namespace = "codex", .format = .siwc }, &output));
     try std.testing.expectEqual(@as(usize, 2), output.items.len);
     try std.testing.expectEqualStrings("codex/z/model", output.items[0].id);
     try std.testing.expectEqualStrings("First model", output.items[0].name.?);
@@ -298,7 +293,7 @@ test "models concurrent callers singleflight and independent result ownership" {
     defer client.deinit();
     var cache: Cache = .{ .allocator = a };
     defer cache.deinit();
-    const source: Source = .{ .url = url, .namespace = "provider", .api = "openai-responses" };
+    const source: Source = .{ .url = url, .namespace = "provider" };
     var first: Caller = .{ .cache = &cache, .client = &client, .source = source, .arena = .init(a) };
     defer first.arena.deinit();
     var second: Caller = .{ .cache = &cache, .client = &client, .source = source, .arena = .init(a) };
@@ -352,7 +347,7 @@ test "models caller cancellation joins socket and releases cache mutex" {
     defer client.deinit();
     var cache: Cache = .{ .allocator = a };
     defer cache.deinit();
-    var caller: Caller = .{ .cache = &cache, .client = &client, .source = .{ .url = url, .namespace = "provider", .api = "openai-responses" }, .arena = .init(a) };
+    var caller: Caller = .{ .cache = &cache, .client = &client, .source = .{ .url = url, .namespace = "provider" }, .arena = .init(a) };
     defer caller.arena.deinit();
     var task = try io.concurrent(Caller.run, .{&caller});
     defer {

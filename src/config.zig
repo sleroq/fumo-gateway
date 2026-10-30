@@ -108,7 +108,7 @@ test "named upstreams own definitions, aliases, and resolved API keys in the con
     try environ.put("PI_KEY", "secret");
     try environ.put("ZEN_KEY", "provider-secret");
     const text = try a.dupe(u8,
-        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"http://127.0.0.1:9090/v1/","aliases":{"fast":"native-model"}},"zen":{"base_url":"https://example.com/v1","protocol":"chat_completions","auth":{"provider":"api_key","key_env":"ZEN_KEY"}}}}
+        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"http://127.0.0.1:9090/v1/","aliases":{"fast":"native-model"}},"zen":{"base_url":"https://example.com/v1","auth":{"provider":"api_key","key_env":"ZEN_KEY"}}}}
     );
     var config = try Config.parse(a, text, &environ);
     defer config.deinit();
@@ -118,7 +118,6 @@ test "named upstreams own definitions, aliases, and resolved API keys in the con
     try std.testing.expectEqualStrings("codex", config.upstreams[0].name);
     try std.testing.expectEqualStrings("http://127.0.0.1:9090/v1", config.upstreams[0].base_url);
     try std.testing.expectEqualStrings("native-model", config.upstreams[0].aliases.map.get("fast").?);
-    try std.testing.expectEqual(.chat_completions, config.upstreams[1].protocol);
     try std.testing.expectEqualStrings("provider-secret", config.upstreams[1].auth.api_key);
 }
 
@@ -145,9 +144,6 @@ test "SIWC configuration resolves private storage and pins inference and discove
         defer a.free(text);
         try std.testing.expectError(error.InvalidCodexEndpoint, Config.parse(a, text, &environ));
     }
-    try std.testing.expectError(error.InvalidCodexEndpoint, Config.parse(a,
-        \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"https://api.openai.com/v1","protocol":"chat_completions","auth":{"provider":"codex"}}}}
-    , &environ));
     try std.testing.expectError(error.InvalidDirectory, Config.parse(a,
         \\{"clients":{"pi":{"key_env":"PI_KEY"}},"upstreams":{"codex":{"base_url":"https://api.openai.com/v1","auth":{"provider":"codex","credentials_dir":""}}}}
     , &environ));
@@ -173,6 +169,7 @@ test "invalid upstream definitions and credentials fail before serving" {
     const cases = .{
         .{ "", "{\"base_url\":\"http://localhost/v1\"}", error.InvalidUpstreamName },
         .{ "bad/name", "{\"base_url\":\"http://localhost/v1\"}", error.InvalidUpstreamName },
+        .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"protocol\":\"chat_completions\"}", error.UnknownField },
         .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"aliases\":{\"\":\"model\"}}", error.EmptyModelAlias },
         .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"aliases\":{\"fast\":\"\"}}", error.EmptyUpstreamModel },
         .{ "demo", "{\"base_url\":\"http://localhost/v1\",\"auth\":{\"provider\":\"api_key\"}}", error.InvalidUpstreamAuth },
