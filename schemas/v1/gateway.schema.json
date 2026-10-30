@@ -1,0 +1,141 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://raw.githubusercontent.com/sleroq/fumo-gateway/main/schemas/v1/gateway.schema.json",
+    "title": "Fumo Gateway configuration (v1)",
+    "description": "Named upstreams, client credentials, and optional administration. Secrets are read from environment variables, never stored in this file.",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "JSON Schema URL used by editors. Ignored by the gateway; never fetched at runtime."
+        },
+        "listen": {
+            "type": "string",
+            "default": "127.0.0.1:8080",
+            "description": "Literal IPv4 or bracketed IPv6 address and port (1–65535), not a hostname. The gateway validates the exact address and port at startup.",
+            "pattern": "^(?:[0-9]+(?:\\.[0-9]+){3}|\\[[0-9a-fA-F:.%]+\\]):[0-9]+$",
+            "examples": ["127.0.0.1:8080", "[::1]:8080"]
+        },
+        "admin": {
+            "type": ["object", "null"],
+            "description": "Override the admin key environment variable. An object requires that variable to be set. When omitted or null, FUMO_ADMIN_KEY still enables administration if set.",
+            "additionalProperties": false,
+            "properties": {
+                "key_env": {
+                    "allOf": [{ "$ref": "#/definitions/keyEnv" }],
+                    "default": "FUMO_ADMIN_KEY"
+                }
+            }
+        },
+        "clients": {
+            "type": "object",
+            "description": "Client labels mapped to inference bearer-key environment variables. Keys must be nonempty, contain no whitespace/control characters, and differ from each other and the admin key.",
+            "propertyNames": { "minLength": 1 },
+            "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key_env"],
+                "properties": {
+                    "key_env": { "$ref": "#/definitions/keyEnv" }
+                }
+            }
+        },
+        "upstreams": {
+            "type": "object",
+            "description": "Upstream names become the namespace in model IDs, for example codex/gpt-5.",
+            "propertyNames": { "pattern": "^[A-Za-z0-9_-]+$" },
+            "additionalProperties": { "$ref": "#/definitions/upstream" }
+        }
+    },
+    "definitions": {
+        "keyEnv": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^=\\u0000]+$",
+            "description": "Name of an environment variable containing a secret, not the secret itself. The variable must be set to a nonempty value without whitespace or control characters."
+        },
+        "upstream": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["base_url"],
+            "properties": {
+                "base_url": {
+                    "type": "string",
+                    "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://(?:\\[[0-9A-Fa-f:.]+\\]|[^\\s/:@?#]+)(?::[0-9]+)?(?:/[^\\s?#]*)?$",
+                    "description": "HTTP(S) API root with a host and optional port (1–65535), without userinfo, query, or fragment. Trailing slashes are removed. Exact URL validity is checked at startup.",
+                    "examples": ["https://api.openai.com/v1", "http://127.0.0.1:9090/v1"]
+                },
+                "aliases": {
+                    "type": "object",
+                    "description": "Local model aliases mapped to nonempty native upstream model IDs. Each request performs one alias lookup.",
+                    "propertyNames": { "minLength": 1 },
+                    "additionalProperties": { "type": "string", "minLength": 1 }
+                },
+                "auth": {
+                    "description": "Omit or use null for no authentication. Choose Sign in with ChatGPT or an API key from the environment.",
+                    "oneOf": [
+                        { "type": "null" },
+                        { "$ref": "#/definitions/codexAuth" },
+                        { "$ref": "#/definitions/apiKeyAuth" }
+                    ]
+                }
+            },
+            "allOf": [
+                {
+                    "if": {
+                        "required": ["auth"],
+                        "properties": {
+                            "auth": {
+                                "type": "object",
+                                "required": ["provider"],
+                                "properties": { "provider": { "const": "codex" } }
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "base_url": {
+                                "type": "string",
+                                "pattern": "^https://api\\.openai\\.com/v1/*$",
+                                "description": "ChatGPT credentials may only be sent to https://api.openai.com/v1."
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        "codexAuth": {
+            "title": "Sign in with ChatGPT",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider"],
+            "properties": {
+                "provider": { "const": "codex" },
+                "credentials_dir": {
+                    "type": ["string", "null"],
+                    "pattern": "[^ \\t\\r\\n]",
+                    "description": "Private credential directory. Omit or use null for the default state directory. Relative paths are resolved from the working directory."
+                },
+                "key_env": {
+                    "type": "null",
+                    "description": "Not used for ChatGPT authentication; omit this field."
+                }
+            }
+        },
+        "apiKeyAuth": {
+            "title": "API key",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider", "key_env"],
+            "properties": {
+                "provider": { "const": "api_key" },
+                "key_env": { "$ref": "#/definitions/keyEnv" },
+                "credentials_dir": {
+                    "type": "null",
+                    "description": "Not used for API-key authentication; omit this field."
+                }
+            }
+        }
+    }
+}

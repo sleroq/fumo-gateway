@@ -11,5 +11,7 @@
         "tests",
         "web",
         "assets",
+        "schemas",
+        "gateway.example.json",
     },
 }

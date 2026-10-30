@@ -1,4 +1,5 @@
 {
+    "$schema": "https://raw.githubusercontent.com/sleroq/fumo-gateway/main/schemas/v1/gateway.schema.json",
     "listen": "127.0.0.1:8080",
     "admin": { "key_env": "FUMO_ADMIN_KEY" },
     "upstreams": {

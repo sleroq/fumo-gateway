@@ -3,6 +3,7 @@ const auth = @import("auth.zig");
 pub const Upstream = @import("provider.zig").Upstream;
 
 const Document = struct {
+    @"$schema": []const u8 = "",
     upstreams: std.json.ArrayHashMap(Upstream.Options) = .{},
     listen: []const u8 = "127.0.0.1:8080",
     clients: std.json.ArrayHashMap(struct { key_env: []const u8 }) = .{},
@@ -92,6 +93,20 @@ test "configuration resolves environment keys and defaults to loopback" {
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, config.address.ip4.bytes);
     try std.testing.expectEqual(8080, config.address.getPort());
     try std.testing.expectEqual(0, config.upstreams.len);
+}
+
+test "schema metadata is accepted without allowing unknown configuration fields" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const text =
+        \\{"$schema":"https://raw.githubusercontent.com/sleroq/fumo-gateway/main/schemas/v1/gateway.schema.json"}
+    ;
+    var config = try Config.parse(std.testing.allocator, text, &environ);
+    defer config.deinit();
+    try std.testing.expectEqual(8080, config.address.getPort());
+    try std.testing.expectError(error.UnknownField, Config.parse(std.testing.allocator,
+        \\{"$schema":"https://example.com/schema.json","typo":true}
+    , &environ));
 }
 
 test "invalid configuration fails before serving" {

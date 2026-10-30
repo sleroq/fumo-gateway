@@ -23,6 +23,9 @@ jobs:
                   nix develop --command bun run --cwd web lint
                   nix develop --command bun run --cwd web typecheck
 
+            - name: Check configuration schema
+              run: nix develop --command bun run --cwd web test:schema
+
             - name: Run browser smoke test
               run: |
                   cd web
