@@ -153,7 +153,6 @@ fn prepareRequest(io: std.Io, gpa: std.mem.Allocator, allocator: std.mem.Allocat
                 const status: std.http.Status, const body: []const u8 = switch (err) {
                     error.InvalidRequest => .{ .bad_request, "{\"error\":\"invalid_request\"}\n" },
                     error.UnknownUpstream => .{ .bad_request, "{\"error\":\"unknown_upstream\"}\n" },
-                    error.ProtocolMismatch => .{ .bad_request, "{\"error\":\"protocol_mismatch\"}\n" },
                     error.StreamTooLong => .{ .payload_too_large, "{\"error\":\"request_too_large\"}\n" },
                     error.HttpExpectationFailed => .{ .expectation_failed, "{\"error\":\"unsupported_expectation\"}\n" },
                     else => return err,

@@ -27,7 +27,7 @@ pub fn prepare(gpa: std.mem.Allocator, arena_allocator: std.mem.Allocator, reque
     const reader = try request.readerExpectContinue(&.{});
     const body = try reader.allocRemaining(gpa, .limited(max_body_size));
     defer gpa.free(body);
-    const routed = try provider.rewriteRequest(gpa, arena_allocator, body, upstreams, protocol);
+    const routed = try provider.rewriteRequest(gpa, arena_allocator, body, upstreams);
     const upstream = upstreams[routed.upstream];
     return .{
         .request = request.*,
@@ -186,8 +186,7 @@ fn requestHeaders(arena_allocator: std.mem.Allocator, request: *std.http.Server.
     var result: std.ArrayList(std.http.Header) = .empty;
     var iterator = request.iterateHeaders();
     while (iterator.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "authorization") or
-            hopByHop(header.name, request.iterateHeaders()) or
+        if (hopByHop(header.name, request.iterateHeaders()) or
             !provider.allowsRequestHeader(header.name)) continue;
         try result.append(arena_allocator, try copyHeader(arena_allocator, header));
     }

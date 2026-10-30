@@ -138,20 +138,16 @@ pub const Cache = struct {
                 const parsed = try std.json.parseFromSliceLeaky(struct { models: []SiwcEntry }, allocator, body, .{ .ignore_unknown_fields = true });
                 var listed: std.ArrayList(Entry) = .empty;
                 for (parsed.models) |entry| {
-                    if (entry.slug.len == 0) return error.EmptyModelId;
                     if (std.mem.eql(u8, entry.visibility, "list"))
                         try listed.append(allocator, .{ .id = entry.slug, .name = entry.display_name });
                 }
                 break :blk listed.items;
             },
         };
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
         var result: std.ArrayList(Model) = .empty;
         const owner = try allocator.dupe(u8, source.namespace);
         for (entries) |entry| {
             if (entry.id.len == 0) return error.EmptyModelId;
-            const slot = try seen.getOrPut(allocator, entry.id);
-            if (slot.found_existing) continue;
             try result.append(allocator, .{
                 .id = try allocator.print("{s}/{s}", .{ source.namespace, entry.id }),
                 .created = entry.created,
@@ -179,7 +175,7 @@ const Fixture = @import("fixture").Fixture;
 test "models fetch authorization nested IDs TTL refresh and stale snapshot" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const first = "{\"data\":[{\"id\":\"org/model\",\"created\":12,\"extra\":true},{\"id\":\"org/model\"}]}";
+    const first = "{\"data\":[{\"id\":\"org/model\",\"created\":12,\"extra\":true}]}";
     const second = "{\"data\":[{\"id\":\"replacement\"}]}";
     const first_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ first.len, first });
     const second_reply = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ second.len, second });

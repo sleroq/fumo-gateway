@@ -531,7 +531,7 @@ test "failed code exchange retains new registration but never replaces an active
         const returning = case.returning;
         const reply = try authTestReply(a, if (case.transient) "500 Internal Server Error" else "400 Bad Request", if (case.transient) "{\"error\":\"server_error\"}" else "{\"error\":\"invalid_grant\"}");
         defer a.free(reply);
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         try tmp.dir.setPermissions(io, .fromMode(0o700));
         const path = try tmp.dir.realPathFileAlloc(io, ".", a);

@@ -45,8 +45,7 @@ pub const Upstream = struct {
         const base_url = std.mem.trimEnd(u8, options.base_url, "/");
         const uri = std.Uri.parse(base_url) catch return error.InvalidUpstreamUrl;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidUpstreamUrl;
-        const host = uri.host orelse return error.InvalidUpstreamUrl;
-        if (host.isEmpty() or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or uri.port == 0) return error.InvalidUpstreamUrl;
+        if (uri.host == null or uri.user != null or uri.query != null or uri.fragment != null or uri.port == 0) return error.InvalidUpstreamUrl;
         var result: Upstream = .{ .name = name, .base_url = base_url, .aliases = options.aliases };
 
         if (options.auth) |auth| switch (auth.provider) {
@@ -198,7 +197,7 @@ pub const Routed = struct { upstream: usize, body: []u8 };
 
 /// Discovery is not an allowlist. Resolve the namespace and optional alias;
 /// the incoming endpoint selects the protocol. Scratch is freed before relay.
-pub fn rewriteRequest(gpa: std.mem.Allocator, allocator: std.mem.Allocator, body: []const u8, upstreams: []const Upstream, protocol: Protocol) !Routed {
+pub fn rewriteRequest(gpa: std.mem.Allocator, allocator: std.mem.Allocator, body: []const u8, upstreams: []const Upstream) !Routed {
     try validateRequestDepth(gpa, body);
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -218,7 +217,6 @@ pub fn rewriteRequest(gpa: std.mem.Allocator, allocator: std.mem.Allocator, body
 
     for (upstreams, 0..) |upstream, index| {
         if (!std.mem.eql(u8, upstream.name, name)) continue;
-        if (upstream.auth == .codex and protocol != .responses) return error.ProtocolMismatch;
         model.* = .{ .string = upstream.aliases.map.get(native) orelse native };
         return .{ .upstream = index, .body = try std.json.Stringify.valueAlloc(allocator, value, .{}) };
     }
@@ -260,7 +258,7 @@ test "provider routing preserves native fields and resolves only the namespace a
     try upstreams[0].aliases.map.put(a, "fast", "upstream-model");
     const routed = try rewriteRequest(a, a,
         \\{"model":"codex/fast","input":[{"type":"function_call_output","call_id":"123","output":"ok"}],"stream":false,"store":true,"temperature":0.5,"max_output_tokens":99,"reasoning":{"effort":"high"},"previous_response_id":"resp_1","metadata":{"precise":18446744073709551617}}
-    , &upstreams, .responses);
+    , &upstreams);
     defer a.free(routed.body);
     try std.testing.expectEqual(0, routed.upstream);
     try std.testing.expect(std.mem.find(u8, routed.body, "18446744073709551617") != null);
@@ -276,19 +274,18 @@ test "provider routing preserves native fields and resolves only the namespace a
     try std.testing.expectEqual(@as(f64, 0.5), value.object.get("temperature").?.float);
 
     // New and nested model IDs work without ever querying discovery.
-    const direct = try rewriteRequest(a, a, "{\"model\":\"zen/vendor/new-model\",\"messages\":[]}", &upstreams, .chat_completions);
+    const direct = try rewriteRequest(a, a, "{\"model\":\"zen/vendor/new-model\",\"messages\":[]}", &upstreams);
     defer a.free(direct.body);
     try std.testing.expectEqual(1, direct.upstream);
     try std.testing.expectEqualStrings("{\"model\":\"vendor/new-model\",\"messages\":[]}", direct.body);
-    try std.testing.expectError(error.UnknownUpstream, rewriteRequest(a, a, "{\"model\":\"missing/model\"}", &upstreams, .responses));
-    try std.testing.expectError(error.UnknownUpstream, rewriteRequest(a, a, "{\"model\":\"unqualified\"}", &upstreams, .responses));
-    const responses = try rewriteRequest(a, a, "{\"model\":\"zen/vendor/another-model\",\"input\":[]}", &upstreams, .responses);
+    try std.testing.expectError(error.UnknownUpstream, rewriteRequest(a, a, "{\"model\":\"missing/model\"}", &upstreams));
+    try std.testing.expectError(error.UnknownUpstream, rewriteRequest(a, a, "{\"model\":\"unqualified\"}", &upstreams));
+    const responses = try rewriteRequest(a, a, "{\"model\":\"zen/vendor/another-model\",\"input\":[]}", &upstreams);
     defer a.free(responses.body);
     try std.testing.expectEqual(1, responses.upstream);
     try std.testing.expectEqualStrings("{\"model\":\"vendor/another-model\",\"input\":[]}", responses.body);
-    try std.testing.expectError(error.ProtocolMismatch, rewriteRequest(a, a, "{\"model\":\"codex/model\",\"messages\":[]}", &upstreams, .chat_completions));
     for ([_][]const u8{ "invalid", "[]", "{}", "{\"model\":1}", "{\"model\":\"codex/\"}" }) |invalid| {
-        try std.testing.expectError(error.InvalidRequest, rewriteRequest(a, a, invalid, &upstreams, .responses));
+        try std.testing.expectError(error.InvalidRequest, rewriteRequest(a, a, invalid, &upstreams));
     }
 }
 
@@ -311,9 +308,9 @@ test "provider request depth bounds arrays, objects, and mixed containers" {
             }
             try input.writer.writeAll("}");
             if (depth > max_request_depth) {
-                try std.testing.expectError(error.InvalidRequest, rewriteRequest(a, a, input.written(), &upstreams, .responses));
+                try std.testing.expectError(error.InvalidRequest, rewriteRequest(a, a, input.written(), &upstreams));
             } else {
-                const routed = try rewriteRequest(a, a, input.written(), &upstreams, .responses);
+                const routed = try rewriteRequest(a, a, input.written(), &upstreams);
                 defer a.free(routed.body);
                 try std.testing.expect(std.mem.find(u8, routed.body, "\"model\":\"model\"") != null);
             }
@@ -334,7 +331,7 @@ test "provider request depth ignores string delimiters and counts nesting rather
     try input.writer.writeAll("\"");
     for (0..300) |_| try input.writer.writeAll(",[{},[]]");
     try input.writer.writeAll("]}");
-    const routed = try rewriteRequest(a, a, input.written(), &upstreams, .responses);
+    const routed = try rewriteRequest(a, a, input.written(), &upstreams);
     defer a.free(routed.body);
     try std.testing.expect(std.mem.find(u8, routed.body, "\"model\":\"model\"") != null);
 }
