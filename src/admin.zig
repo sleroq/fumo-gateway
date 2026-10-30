@@ -8,7 +8,7 @@ const assets = @import("web_assets");
 pub fn isLoopback(address: std.Io.net.IpAddress) bool {
     return switch (address) {
         .ip4 => |ip| ip.bytes[0] == 127,
-        .ip6 => |ip| std.mem.eql(u8, &ip.bytes, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }),
+        .ip6 => |ip| std.mem.eql(u8, &ip.bytes, &std.Io.net.Ip6Address.loopback(0).bytes),
     };
 }
 
