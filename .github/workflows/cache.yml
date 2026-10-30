@@ -1,0 +1,37 @@
+name: Cache
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fumo-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Build and test Fumo gateway
+        id: build
+        run: |
+          path=$(nix build .#packages.x86_64-linux.default --no-link --print-out-paths)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Attic
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          nix profile install --inputs-from . nixpkgs#attic-client
+          attic login fumo-gateway https://cache.cum.army/ "$ATTIC_TOKEN"
+
+      - name: Push Fumo gateway closure
+        env:
+          BUILD_PATH: ${{ steps.build.outputs.path }}
+        run: attic push fumo-gateway "$BUILD_PATH"
