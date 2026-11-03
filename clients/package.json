@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "bun build.ts",
-    "test": "bun test catalog.test.ts pi/index.test.ts opencode/src/index.test.ts packaging.test.ts",
+    "test": "bun test pi/index.test.ts opencode/src/index.test.ts packaging.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

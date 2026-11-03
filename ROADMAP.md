@@ -21,7 +21,7 @@
 - Secrets supplied separately from configuration.
 - Configuration changes take effect on restart; OAuth credentials and ephemeral discovery caches are the only mutable provider state.
 - Multiple labeled inference client keys and a separate admin bearer key.
-- HTTP CONNECT and SOCKS5 proxy support, applied to all calls to upstreams
+- **Done:** HTTP CONNECT and SOCKS5 proxy support via `proxy_env`, applied to gateway-originated inference, model discovery, and SIWC code exchange and refresh.
 
 ### Observability
 
@@ -48,9 +48,9 @@ Universal protocol translation, automatic model-family guessing, cross-provider 
 
 ## Current limitations
 
-- Outbound proxies and Prometheus metrics are not implemented yet.
+- Prometheus metrics are not implemented yet.
+- Outbound proxies use local destination DNS resolution; remote DNS (`socks5h`) and HTTPS-to-proxy are unsupported. Browser login navigation is not routed through the gateway proxy.
 - Model catalogs are unfiltered and do not assign protocols; clients select the native API. Anthropic Messages and Google-native protocols are not supported.
-- Concurrency is implemented via worker threads and std.Id.Threaded. With SSE this will likely cause a lot of workers to be waiting for idle SSE connections and needs to be fixed in the future
 - WebSockets would be cool to have for codex but it's probably very complex
 
 ## Post V1 Features

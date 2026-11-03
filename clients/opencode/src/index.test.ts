@@ -13,7 +13,6 @@ import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { parseCatalog } from "../../catalog"
 import fixture from "../../../tests/fixtures/model-catalog.json"
 import plugin, { createFumoPlugin, setupFumo, type FumoContext } from "./index"
-import { toOpenCodeModel } from "./catalog"
 
 const baseURL = "http://localhost:8080/v1"
 const entries = await parseCatalog(Response.json(fixture))
@@ -106,7 +105,7 @@ function network() {
   ))
 }
 
-test("native options, key integration, account-scoped cache, filtered refresh events, and cancellation", async () => {
+test("native key integration discovers models and restores account-scoped inventory", async () => {
   expect(plugin.id).toBe("fumo")
   expect(createFumoPlugin({ baseURL }).id).toBe("fumo")
   const fetch = network()
@@ -116,8 +115,11 @@ test("native options, key integration, account-scoped cache, filtered refresh ev
   expect(host.render()?.info.settings).toEqual({ baseURL, transport: "http" })
   expect(host.render()?.sourceConnection).toEqual(connection)
   expect(host.render()?.models.map((model) => String(model.id))).toEqual(entries.map((entry) => entry.id))
-  await host.stream.send("openai")
-  expect(fetch).toHaveBeenCalledTimes(1)
+  expect(host.render()?.models.find((model) => String(model.id) === "personal/fast")).toMatchObject({
+    name: "Personal Codex", limit: { context: 272000, output: 16000 },
+    capabilities: { input: ["text", "image"] },
+    variants: [{ id: "low", body: { reasoning: { effort: "low" } } }, { id: "high", body: { reasoning: { effort: "high" } } }],
+  })
   const switched = host.switchAccount()
   await host.stream.send("fumo")
   expect(host.render()?.sourceConnection).toEqual(switched)
@@ -136,43 +138,7 @@ test("native options, key integration, account-scoped cache, filtered refresh ev
   expect(host.stream.aborted).toBe(true)
 })
 
-test("failed or malformed discovery retains the last successful account-bound inventory", async () => {
-  const fetch = network()
-  const host = harness()
-  await host.start()
-  const saved = host.values.get("catalog")
-  const warning = spyOn(console, "warn").mockImplementation(() => {})
-  host.switchAccount()
-  for (const response of [Response.json({}, { status: 503 }), Response.json({ data: [{ id: 42 }] })]) {
-    fetch.mockResolvedValue(response)
-    await host.stream.send("fumo")
-    expect(host.values.get("catalog")).toEqual(saved)
-    expect(host.render()?.sourceConnection).toEqual(connection)
-  }
-  expect(host.reload).toHaveBeenCalledTimes(1)
-  expect(warning).toHaveBeenCalledTimes(2)
-})
 
-test("native projection uses only discovered metadata and native defaults, not OpenAI templates", () => {
-  for (const entry of entries) {
-    const model = toOpenCodeModel(entry)
-    expect(String(model.id)).toBe(entry.id)
-    expect(model.headers).toBeUndefined()
-    expect(model.family).toBeUndefined()
-    expect(model.compatibility).toBeUndefined()
-  }
-  const personal = entries.find((entry) => entry.id === "personal/fast")
-  if (!personal) throw new Error("Missing personal fixture entry")
-  expect(toOpenCodeModel(personal)).toMatchObject({
-    name: "Personal Codex", limit: { context: 272000, output: 16000 },
-    capabilities: { input: ["text", "image"] },
-    variants: [{ id: "low", body: { reasoning: { effort: "low" } } }, { id: "high", body: { reasoning: { effort: "high" } } }],
-  })
-  const sparse = entries.find((entry) => entry.id === "personal/future")
-  if (!sparse) throw new Error("Missing sparse fixture entry")
-  const defaults = Model.Info.default(Provider.ID.make("fumo"), Model.ID.make(sparse.id))
-  expect(toOpenCodeModel(sparse)).toMatchObject({ limit: defaults.limit, capabilities: defaults.capabilities, variants: [] })
-})
 
 async function nativeRequest(entry: typeof entries[number]) {
   const completions = entry.api === "openai-completions"

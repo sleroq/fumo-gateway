@@ -11,6 +11,13 @@ in
       description = "Literal IPv4 or bracketed IPv6 address and port. Keep this on loopback when using a reverse proxy.";
     };
 
+    proxy_env = mkOption {
+      type = types.nullOr types.nonEmptyStr;
+      default = null;
+      example = "FUMO_PROXY";
+      description = "Environment variable containing the outbound HTTP or SOCKS5 proxy URL, including any credentials.";
+    };
+
     admin = mkOption {
       type = types.nullOr (
         types.submodule {

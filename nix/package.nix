@@ -2,7 +2,7 @@
   lib,
   stdenvNoCC,
   bun,
-  zig_0_17,
+  rustPlatform,
 }:
 let
   webDependencies = stdenvNoCC.mkDerivation {
@@ -30,16 +30,17 @@ let
     outputHash = "sha256-WYiZ881jIVSlXgjUmboMcchfSVbmrvxiyoqSdmgLgBY=";
   };
 in
-stdenvNoCC.mkDerivation {
+rustPlatform.buildRustPackage {
   pname = "fumo-gateway";
   version = "0.0.0";
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../build.zig
-      ../build.zig.zon
-      ../src
-      ../tests
+      ../Cargo.toml
+      ../Cargo.lock
+      ../build.rs
+      (lib.fileset.fileFilter (file: file.hasExt "rs") ../src)
+      (lib.fileset.fileFilter (file: file.hasExt "rs" || file.hasExt "json") ../tests)
       ../assets
       ../schemas
       ../gateway.example.json
@@ -51,11 +52,9 @@ stdenvNoCC.mkDerivation {
       ))
     ];
   };
-  nativeBuildInputs = [
-    zig_0_17.hook
-    bun
-  ];
-  preConfigure = ''
+  cargoLock.lockFile = ../Cargo.lock;
+  nativeBuildInputs = [ bun ];
+  preBuild = ''
     cp -R ${webDependencies} web/node_modules
     chmod -R u+w web/node_modules
     substituteInPlace web/node_modules/typescript/bin/tsc web/node_modules/vite/bin/vite.js \

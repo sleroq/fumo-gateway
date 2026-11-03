@@ -17,6 +17,10 @@
             "pattern": "^(?:[0-9]+(?:\\.[0-9]+){3}|\\[[0-9a-fA-F:.%]+\\]):[0-9]+$",
             "examples": ["127.0.0.1:8080", "[::1]:8080"]
         },
+        "proxy_env": {
+            "description": "Environment variable containing the outbound proxy URL, never the URL or credentials themselves. Omit or use null for direct connections; HTTP_PROXY and similar variables are not inferred. Supports http://[user:password@]host:port or socks5://[user:password@]host:port with an explicit port and an empty or / path. Destination DNS is resolved locally; socks5h and HTTPS-to-proxy are unsupported. Applies to gateway-originated inference, model discovery, and SIWC code exchange and refresh, not browser login navigation. Destination HTTPS certificate verification is unchanged.",
+            "anyOf": [{ "$ref": "#/definitions/keyEnv" }, { "type": "null" }]
+        },
         "admin": {
             "type": ["object", "null"],
             "description": "Override the admin key environment variable. An object requires that variable to be set. When omitted or null, FUMO_ADMIN_KEY still enables administration if set.",
@@ -53,7 +57,7 @@
             "type": "string",
             "minLength": 1,
             "pattern": "^[^=\\u0000]+$",
-            "description": "Name of an environment variable containing a secret, not the secret itself. The variable must be set to a nonempty value without whitespace or control characters."
+            "description": "Name of an environment variable containing a secret, not the secret itself. The variable must be set to a nonempty value. API and admin key values must not contain whitespace or control characters; proxy URL values follow URL syntax and may use percent encoding."
         },
         "upstream": {
             "type": "object",

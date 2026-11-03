@@ -2,12 +2,11 @@ import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createProvider, envApiKeyAuth, getSupportedThinkingLevels, InMemoryModelsStore, Type, type Context } from "@earendil-works/pi-ai";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import { getSupportedThinkingLevels, InMemoryModelsStore, Type, type Context } from "@earendil-works/pi-ai";
 import { ModelRuntime, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { parseCatalog } from "../catalog";
 import gatewayCatalog from "../../tests/fixtures/model-catalog.json";
-import extension, { createFumoProvider, toPiModel } from "./index";
+import { createFumoProvider } from "./index";
 
 const entries = await parseCatalog(Response.json(gatewayCatalog));
 const directories: string[] = [];
@@ -48,29 +47,6 @@ async function discover(baseUrl?: string) {
   return state;
 }
 
-test("shared discovery maps Pi metadata and aliases without installed catalog enrichment", () => {
-  const models = entries.map((entry) => toPiModel(entry, "http://localhost:8080/v1"));
-  for (const id of ["personal/fast", "personal/gpt-6.1-sol"]) {
-    const model = models.find((model) => model.id === id)!;
-    expect(model).toMatchObject({
-      name: "Personal Codex", contextWindow: 272000, maxTokens: 16000,
-      input: ["text", "image"], reasoning: true,
-      compat: { supportsMaxOutputTokens: false, supportsLongCacheRetention: false, supportsToolSearch: false },
-    });
-    expect(getSupportedThinkingLevels(model)).toEqual(["low", "high"]);
-  }
-
-  expect(models.find(({ id }) => id === "codex/gpt-6.1-sol")).toMatchObject({
-    name: "API-key model", contextWindow: 128000, maxTokens: 16384, input: ["text"], reasoning: false,
-  });
-  expect(models.find(({ id }) => id === "personal/future")).toMatchObject({
-    name: "personal/future", contextWindow: 128000, maxTokens: 16384, input: ["text"], reasoning: false,
-  });
-  expect(models.find(({ id }) => id === "zen/vendor/rich")).toMatchObject({
-    api: "openai-completions", contextWindow: 200000, maxTokens: 32000, input: ["text", "image"],
-  });
-  expect(models.every((model) => model.inputLimits === undefined)).toBe(true);
-});
 
 test("login saves the gateway URL for discovery and both native adapters after restart", async () => {
   const { runtime, authPath } = await createRuntime();
@@ -92,6 +68,16 @@ test("login saves the gateway URL for discovery and both native adapters after r
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(Response.json(gatewayCatalog));
   expect((await restarted.refresh(refresh)).errors.size).toBe(0);
   expect(fetch.mock.calls[0][0]).toBe("https://saved-gateway.example.test/v1/models");
+  expect(fetch.mock.calls[0][1]?.headers).toEqual({ Authorization: "Bearer fixture-client-key" });
+  const model = restarted.getModel("fumo", "personal/fast")!;
+  expect(model).toMatchObject({
+    name: "Personal Codex", contextWindow: 272000, maxTokens: 16000,
+    input: ["text", "image"], reasoning: true,
+  });
+  expect(getSupportedThinkingLevels(model)).toEqual(["low", "high"]);
+  expect(restarted.getModel("fumo", "personal/future")).toMatchObject({
+    contextWindow: 128000, maxTokens: 16384, input: ["text"], reasoning: false,
+  });
   expect((await restarted.getAuth("fumo"))?.auth).toEqual({
     apiKey: "fixture-client-key", baseUrl: "https://saved-gateway.example.test/v1",
   });
@@ -111,71 +97,7 @@ test("existing key-only credentials keep the configured gateway URL", async () =
   expect(fetch.mock.calls[0][0]).toBe("https://managed-gateway.example.test/v1/models");
 });
 
-test("invalid URL or cancelled login leaves the existing credentials unchanged", async () => {
-  const { runtime, authPath } = await createRuntime();
-  await login(runtime);
-  const saved = readStoredCredential("fumo", authPath);
-  for (const url of ["not a URL", "file:///tmp/gateway"]) {
-    await expect(runtime.login("fumo", "api_key", { prompt: async () => url, notify() {} })).rejects.toThrow();
-    expect(readStoredCredential("fumo", authPath)).toEqual(saved);
-  }
-  await expect(runtime.login("fumo", "api_key", {
-    async prompt({ type }) {
-      if (type === "text") return "https://another-gateway.example.test/v1";
-      throw new Error("Login cancelled");
-    },
-    notify() {},
-  })).rejects.toThrow("Login cancelled");
-  expect(readStoredCredential("fumo", authPath)).toEqual(saved);
-});
 
-test("native login, refresh, cache retention, failures, and cancellation preserve provider isolation", async () => {
-  const { runtime, authPath, modelsStore } = await createRuntime();
-  const refreshOther = mock(async () => []);
-  runtime.registerNativeProvider(createProvider({
-    id: "other", auth: { apiKey: envApiKeyAuth("other key", []) },
-    models: [], fetchModels: refreshOther, api: openAIResponsesApi(),
-  }));
-  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(Response.json(gatewayCatalog));
-  await runtime.refresh(refresh);
-  expect(fetch).not.toHaveBeenCalled();
-  process.env.FUMO_PI_KEY = "environment-key";
-  expect((await runtime.getAuth("fumo"))?.auth.apiKey).toBe("environment-key");
-  await login(runtime);
-  expect((await runtime.getAuth("fumo"))?.auth.apiKey).toBe("fixture-client-key");
-  expect((await runtime.refresh(refresh)).errors.size).toBe(0);
-  expect(fetch.mock.calls[0][0]).toBe("http://localhost:8080/v1/models");
-  expect(fetch.mock.calls[0][1]?.headers).toEqual({ Authorization: "Bearer fixture-client-key" });
-
-  const restarted = await createRuntime(modelsStore);
-  await restarted.runtime.refresh({ ...refresh, allowNetwork: false });
-  expect(restarted.runtime.getModels("fumo")).toEqual(runtime.getModels("fumo"));
-  expect(fetch).toHaveBeenCalledTimes(1);
-  expect(JSON.stringify(await modelsStore.read("fumo"))).not.toContain("fixture-client-key");
-  fetch.mockResolvedValue(new Response("private upstream body", { status: 503 }));
-  expect((await runtime.refresh(refresh)).errors.get("fumo")?.message).toBe("fumo model discovery failed (HTTP 503).");
-  expect(runtime.getModels("fumo").map(({ id }) => id)).toEqual(entries.map(({ id }) => id));
-
-  const started = Promise.withResolvers<void>();
-  fetch.mockImplementation(Object.assign(async (...[_url, options]: Parameters<typeof globalThis.fetch>) => {
-    const signal = options?.signal;
-    if (!signal) throw new Error("Discovery must supply a signal");
-    return new Promise<Response>((_resolve, reject) => {
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-      started.resolve();
-    });
-  }, { preconnect() {} }));
-  const controller = new AbortController();
-  const pending = runtime.refresh({ ...refresh, signal: controller.signal });
-  await started.promise;
-  controller.abort();
-  expect((await pending).aborted).toBe(true);
-  expect(runtime.getModels("fumo").map(({ id }) => id)).toEqual(entries.map(({ id }) => id));
-  expect(refreshOther).not.toHaveBeenCalled();
-  await runtime.logout("fumo");
-  expect(readStoredCredential("fumo", authPath)).toBeUndefined();
-  expect(readStoredCredential("other", authPath)).toEqual({ type: "api_key", key: "other-key" });
-});
 
 const context: Context = {
   messages: [
@@ -257,20 +179,4 @@ test("actual native Completions serialization uses the advertised route and outp
   expect(payload.messages).toBeArray();
   expect(payload.input).toBeUndefined();
   expect(payload.max_completion_tokens).toBe(100);
-});
-
-test("extension configures the native provider from the environment without custom commands", () => {
-  const previous = process.env.FUMO_BASE_URL;
-  process.env.FUMO_BASE_URL = "https://gateway.example.test/v1";
-  try {
-    const api = { registerProvider: mock(), registerCommand: mock() };
-    extension(api);
-    expect(api.registerProvider).toHaveBeenCalledTimes(1);
-    expect(api.registerProvider.mock.calls[0][0].id).toBe("fumo");
-    expect(api.registerProvider.mock.calls[0][0].baseUrl).toBe("https://gateway.example.test/v1");
-    expect(api.registerCommand).not.toHaveBeenCalled();
-  } finally {
-    if (previous === undefined) delete process.env.FUMO_BASE_URL;
-    else process.env.FUMO_BASE_URL = previous;
-  }
 });

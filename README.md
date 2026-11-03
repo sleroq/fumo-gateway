@@ -7,7 +7,7 @@ Forwards native OpenAI Responses and Chat Completions requests; no protocol tran
 
 ## Quick start
 
-Requires Zig **0.17.0** and **Bun** (`nix develop`). Copy
+Requires **Rust** and **Bun** (`nix develop`). Copy
 [`gateway.example.json`](gateway.example.json), remove unused upstreams, and set
 the provider API keys referenced by your configuration.
 
@@ -16,14 +16,20 @@ bun install --cwd web --frozen-lockfile
 cp gateway.example.json gateway.json
 export FUMO_PI_KEY="$(openssl rand -hex 32)"
 export FUMO_ADMIN_KEY="$(openssl rand -hex 32)"
-zig build
-zig-out/bin/fumo-gateway --config gateway.json
+cargo build --release
+./target/release/fumo-gateway --config gateway.json
 ```
 
 For ChatGPT, open **http://127.0.0.1:8080/admin/**, unlock with `FUMO_ADMIN_KEY`.
 For remote administration, use an SSH tunnel; do not expose admin access over plaintext HTTP.
 
 Point your client at `http://127.0.0.1:8080/v1` with `FUMO_PI_KEY` as its bearer key.
+
+## Outbound proxy
+
+Set `"proxy_env": "FUMO_PROXY"` in your configuration and export
+`FUMO_PROXY=http://127.0.0.1:8081` (or `socks5://127.0.0.1:1080`), then restart.
+Omit `proxy_env` for direct connections; conventional proxy variables are ignored.
 
 ## Nix
 
@@ -70,7 +76,8 @@ restart OpenCode to retry discovery or pick up gateway catalog changes.
 
 ## Development
 
-Run `zig build test`, `zig build test-auth`, and `zig build test-service`.
+Run `cargo test` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+The Rust build embeds the admin UI and runs the frontend build with Bun.
 Frontend checks: `bun run --cwd web lint`, `typecheck`, and `test` (each as a separate script).
 For frontend development, run the gateway and `bun run --cwd web dev`.
 

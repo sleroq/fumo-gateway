@@ -41,8 +41,12 @@
         in
         {
           default = pkgs.mkShell {
+            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             packages = [
-              pkgs.zig_0_17
+              pkgs.rustc
+              pkgs.cargo
+              pkgs.clippy
+              pkgs.rustfmt
               pkgs.bun
             ];
           };

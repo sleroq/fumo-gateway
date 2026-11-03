@@ -38,11 +38,13 @@ jobs:
                   nix develop .. --command bun --bun playwright install --with-deps chromium
                   nix develop .. --command bun run test:browser
 
-            - name: Check Zig formatting
-              run: nix develop --command zig fmt --check build.zig src tests
+            - name: Check Rust formatting and lints
+              run: |
+                  nix develop --command cargo fmt --all -- --check
+                  nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-            - name: Run debug tests
-              run: nix develop --command zig build test -Doptimize=Debug --summary all
+            - name: Run Rust tests
+              run: nix develop --command cargo test --locked
 
             - name: Build and test Nix package
               run: nix build .#packages.x86_64-linux.default --no-link --print-build-logs

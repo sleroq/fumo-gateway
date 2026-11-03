@@ -37,6 +37,8 @@ With agenix configured, add this host module:
 ```
 
 Put `FUMO_PI_KEY` and `FUMO_ADMIN_KEY` in the encrypted file as `NAME=value` lines.
+To use an outbound proxy, set `settings.proxy_env = "FUMO_PROXY"` and put the
+proxy URL in the same environment file; see the [proxy documentation](../README.md#outbound-proxy).
 
 ## ChatGPT login
 

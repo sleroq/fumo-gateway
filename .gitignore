@@ -1,6 +1,5 @@
 .direnv/
-.zig-cache/
-zig-out/
+/target/
 web/node_modules/
 clients/node_modules/
 clients/**/node_modules/
