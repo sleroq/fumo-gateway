@@ -8,7 +8,7 @@ mod outbound;
 
 use std::path::Path;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
         eprintln!("event=command_failed error={error:#}");
