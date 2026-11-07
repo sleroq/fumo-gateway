@@ -12,7 +12,10 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::{Mutex, Notify},
+    time::Instant,
+};
 
 const ORIGIN: &str = "https://auth.openai.com";
 const REDIRECT: &str = "http://127.0.0.1:1455/auth/callback";
@@ -81,6 +84,7 @@ pub struct Session {
     client: reqwest::Client,
     origin: String,
     state: Mutex<State>,
+    refreshed: Notify,
     login: Mutex<()>,
 }
 
@@ -125,11 +129,12 @@ impl Session {
                 refreshing: false,
                 retry_at: None,
             }),
+            refreshed: Notify::new(),
             login: Mutex::new(()),
         }))
     }
 
-    /// Token exchange never delays the current request, even after expiry.
+    /// Refresh valid tokens in the background; wait for refresh after expiry.
     pub async fn authorization(self: &Arc<Self>) -> Result<String> {
         let mut state = self.state.lock().await;
         let current = &state.credentials;
@@ -144,6 +149,12 @@ impl Session {
             state.refreshing = true;
             let session = Arc::clone(self);
             tokio::spawn(async move { session.refresh(snapshot, generation).await });
+        }
+        if state.credentials.expires_at <= now() && state.refreshing {
+            let refreshed = self.refreshed.notified();
+            drop(state);
+            refreshed.await;
+            state = self.state.lock().await;
         }
         if state.credentials.expires_at <= now() {
             bail!("CredentialsUnavailable");
@@ -313,6 +324,7 @@ impl Session {
         let result = tokio::time::timeout(Duration::from_secs(30), exchange).await;
         let mut state = self.state.lock().await;
         state.refreshing = false;
+        self.refreshed.notify_waiters();
         if state.generation != generation {
             return;
         }
@@ -656,6 +668,52 @@ mod tests {
             assert_eq!(state.credentials.access_token, "old-access");
             assert_eq!(state.credentials.refresh_token, "old-refresh");
         }
+    }
+
+    #[tokio::test]
+    async fn expired_requests_wait_for_the_same_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("credentials");
+        save(
+            &directory,
+            &Credentials {
+                access_token: "old-access".into(),
+                refresh_token: "old-refresh".into(),
+                expires_at: now() - 1,
+                ..Credentials::default()
+            },
+        )
+        .unwrap();
+        let (origin, request) = fixture("200 OK", TOKENS).await;
+        let mut session = session(&directory);
+        Arc::get_mut(&mut session).unwrap().origin = origin;
+        let (first, second) = tokio::join!(session.authorization(), session.authorization());
+        assert_eq!(first.unwrap(), "Bearer new-access");
+        assert_eq!(second.unwrap(), "Bearer new-access");
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_request_fails_when_refresh_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("credentials");
+        save(
+            &directory,
+            &Credentials {
+                refresh_token: "old-refresh".into(),
+                expires_at: now() - 1,
+                ..Credentials::default()
+            },
+        )
+        .unwrap();
+        let (origin, request) =
+            fixture("500 Internal Server Error", r#"{"error":"failure"}"#).await;
+        let mut session = session(&directory);
+        Arc::get_mut(&mut session).unwrap().origin = origin;
+        assert!(session.authorization().await.is_err());
+        request.await.unwrap();
+        assert!(session.authorization().await.is_err());
+        assert!(session.state.lock().await.retry_at.is_some());
     }
 
     #[tokio::test]
