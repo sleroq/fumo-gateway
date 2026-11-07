@@ -37,6 +37,7 @@ export function toPiModel(entry: CatalogEntry, baseUrl: string): Model<"openai-r
 
   if (metadata.constraints && compat) {
     if (metadata.constraints.omit.includes("max_output_tokens")) compat.supportsMaxOutputTokens = false;
+    if (metadata.constraints.omit.includes("prompt_cache_options")) compat.supportsExplicitPromptCacheMode = false;
     if (metadata.constraints.omit.includes("prompt_cache_retention")) compat.supportsLongCacheRetention = false;
     // Pi needs both flags to place function tools in native additional_tools items.
     compat.supportsAdditionalTools = true;

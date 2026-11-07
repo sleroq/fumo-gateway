@@ -145,7 +145,7 @@ async function nativeRequest(entry: typeof entries[number]) {
   const configure = completions ? OpenAICompatible.configure : provider.configure
   const model = configure({
     baseURL, apiKey: "test-client-key",
-    http: { body: { prompt_cache_retention: "24h", previous_response_id: "resp_old" } },
+    http: { body: { prompt_cache_options: { mode: "explicit" }, prompt_cache_retention: "24h", previous_response_id: "resp_old" } },
   }).model(entry.id)
   const request = new LLMRequest({
     model, system: [{ type: "text", text: "Be helpful" }],
@@ -187,7 +187,7 @@ test("actual native Responses and Completions wire requests follow advertised co
     const before = await outgoing.clone().json()
     const completions = entry.api === "openai-completions"
     expect(outgoing.url).toBe(`${baseURL}/${completions ? "chat/completions" : "responses"}`)
-    expect(before).toMatchObject({ model: entry.id, stream: true, temperature: 0.7, top_p: 0.9 })
+    expect(before).toMatchObject({ model: entry.id, stream: true, temperature: 0.7, top_p: 0.9, prompt_cache_options: { mode: "explicit" } })
     expect(before[completions ? "max_completion_tokens" : "max_output_tokens"]).toBe(4096)
     const input: SessionHttpRequest = {
       sessionID: Session.ID.create(), agent: Agent.ID.make("test"), kind: "primary",

@@ -174,6 +174,7 @@ async fn responses_and_chat_preserve_payload_status_and_safe_headers() {
             }
             let value: Value = serde_json::from_str(&body_in).unwrap();
             assert_eq!(value["model"], "native");
+            assert_eq!(value["prompt_cache_options"], json!({"mode": "explicit"}));
             assert_eq!(
                 value["opaque"]["nested"],
                 json!([null, true, {"x": "unchanged"}])
@@ -189,7 +190,7 @@ async fn responses_and_chat_preserve_payload_status_and_safe_headers() {
             .await;
         }
     });
-    let body = r#"{"model":"fixture/alias","opaque":{"nested":[null,true,{"x":"unchanged"}],"integer":184467440737095516170,"decimal":0.12345678901234567890123456789}}"#;
+    let body = r#"{"model":"fixture/alias","prompt_cache_options":{"mode":"explicit"},"opaque":{"nested":[null,true,{"x":"unchanged"}],"integer":184467440737095516170,"decimal":0.12345678901234567890123456789}}"#;
     for (path, status, header, expected, text) in [
         ("/v1/responses", 429, "retry-after", "17", "busy"),
         (

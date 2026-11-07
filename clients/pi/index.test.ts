@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getSupportedThinkingLevels, InMemoryModelsStore, Type, type Context } from "@earendil-works/pi-ai";
-import { ModelRuntime, readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { generateSummary, ModelRuntime, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { parseCatalog } from "../catalog";
 import gatewayCatalog from "../../tests/fixtures/model-catalog.json";
 import { createFumoProvider } from "./index";
@@ -139,7 +139,7 @@ async function nativeRequest(runtime: ModelRuntime, id: string, cacheRetention: 
   return { request: requests[0], payload };
 }
 
-test("constrained native Responses keeps full IDs, tools, top-level effort, and explicit cache mode", async () => {
+test("constrained native Responses keeps full IDs, tools, and top-level effort", async () => {
   const { runtime } = await discover("https://gateway.example.test/v1");
   const { request, payload } = await nativeRequest(runtime, "personal/gpt-6.1-sol");
   expect(request.url).toBe("https://gateway.example.test/v1/responses");
@@ -153,7 +153,9 @@ test("constrained native Responses keeps full IDs, tools, top-level effort, and 
   expect(payload.input.some((item: { type?: string }) => item.type?.startsWith("tool_search"))).toBe(false);
   expect(payload.input.some((item: { type?: string }) => item.type === "configuration_update")).toBe(false);
   expect(payload.reasoning.effort).toBe("high");
-  expect((await nativeRequest(runtime, "personal/gpt-6.1-sol", "none")).payload.prompt_cache_options).toEqual({ mode: "explicit" });
+  const withoutCache = (await nativeRequest(runtime, "personal/gpt-6.1-sol", "none")).payload;
+  expect(withoutCache.prompt_cache_options).toBeUndefined();
+  expect(withoutCache.prompt_cache_key).toBeUndefined();
 
   const alias = (await nativeRequest(runtime, "personal/fast")).payload;
   expect(alias.max_output_tokens).toBeUndefined();
@@ -161,11 +163,52 @@ test("constrained native Responses keeps full IDs, tools, top-level effort, and 
   expect(alias.input).toContainEqual(expect.objectContaining({ type: "additional_tools" }));
 });
 
+test("compaction summarizes with the Sign in with ChatGPT model without unsupported cache options", async () => {
+  const { runtime } = await discover();
+  const requests: Request[] = [];
+  spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+    const request = new Request(input, init);
+    requests.push(request);
+    const payload = await request.clone().json();
+    if (payload.prompt_cache_options) {
+      return Response.json({ error: {
+        message: "prompt_cache_options is not supported on this model",
+        type: "invalid_request_error", param: "prompt_cache_options", code: "invalid_parameter",
+      } }, { status: 400 });
+    }
+    const events = [
+      { type: "response.output_item.done", output_index: 0, item: {
+        type: "message", id: "msg_summary", role: "assistant", content: [{ type: "output_text", text: "Fixture summary" }],
+      } },
+      { type: "response.completed", response: {
+        id: "fixture-response", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      } },
+    ];
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }, { preconnect() {} }));
+  const summary = await generateSummary(
+    [{ role: "user", content: "Keep this context", timestamp: 1 }],
+    runtime.getModel("fumo", "personal/gpt-6.1-sol")!, undefined, undefined,
+    undefined, undefined, undefined, undefined, "high", runtime.streamSimple.bind(runtime),
+  );
+  expect(summary).toBe("Fixture summary");
+  expect(requests).toHaveLength(1);
+  expect(requests[0].url).toBe("http://localhost:8080/v1/responses");
+  const payload = await requests[0].json();
+  expect(payload.model).toBe("personal/gpt-6.1-sol");
+  expect(payload.prompt_cache_options).toBeUndefined();
+  expect(payload.prompt_cache_retention).toBeUndefined();
+  expect(payload.prompt_cache_key).toBeUndefined();
+});
+
 test("API-key codex namespace preserves native output/cache controls without inventing reasoning metadata", async () => {
   const { runtime } = await discover();
   const known = (await nativeRequest(runtime, "codex/gpt-6.1-sol")).payload;
   expect(known.max_output_tokens).toBe(100);
   expect(known.prompt_cache_options).toEqual({ ttl: "30m" });
+  expect((await nativeRequest(runtime, "codex/gpt-6.1-sol", "none")).payload.prompt_cache_options).toEqual({ mode: "explicit" });
   expect(known.reasoning).toBeUndefined();
   const alias = (await nativeRequest(runtime, "codex/quick")).payload;
   expect(alias.max_output_tokens).toBe(100);

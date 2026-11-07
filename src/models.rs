@@ -191,7 +191,7 @@ fn with_constraints(model: Value, siwc: bool) -> Value {
         object.insert(key.clone(), value.clone());
     }
     object.insert("request_constraints".into(), json!({"responses": {
-        "omit": ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id"],
+        "omit": ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id"],
         "function_tools": "namespaced-or-additional",
         "unsupported_tools": ["image_generation", "file_search", "code_interpreter", "computer_use_preview", "mcp", "tool_search", "programmatic_tool_calling"]
     }}));
