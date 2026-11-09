@@ -232,7 +232,7 @@ async fn forward(gateway: &Gateway, request: Request<Body>, path: &str) -> Respo
         .header(header::ACCEPT_ENCODING, "identity")
         .body(body);
     for (name, value) in &parts.headers {
-        if allowed_request_header(name) && !connection_header(name, &parts.headers) {
+        if !blocked_request_header(name, &parts.headers) {
             outgoing = outgoing.header(name, value);
         }
     }
@@ -309,17 +309,17 @@ pub(crate) fn body_error(err: axum::Error) -> Response {
     }
 }
 
-fn allowed_request_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "accept"
-            | "x-request-id"
-            | "openai-beta"
-            | "session_id"
-            | "conversation_id"
-            | "x-codex-turn-metadata"
-            | "x-codex-turn-state"
-    )
+fn blocked_request_header(name: &HeaderName, headers: &HeaderMap) -> bool {
+    hop_by_hop(name, headers)
+        || matches!(
+            name.as_str(),
+            "authorization"
+                | "host"
+                | "content-length"
+                | "content-type"
+                | "accept-encoding"
+                | "expect"
+        )
 }
 
 fn hop_by_hop(name: &HeaderName, headers: &HeaderMap) -> bool {

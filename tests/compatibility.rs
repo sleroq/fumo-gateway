@@ -139,7 +139,7 @@ async fn reply(socket: &mut TcpStream, status: &str, headers: &str, body: &str) 
 }
 
 #[tokio::test]
-async fn responses_and_chat_preserve_payload_status_and_safe_headers() {
+async fn responses_and_chat_preserve_payload_status_and_end_to_end_headers() {
     let (origin, base) = listener().await;
     let gateway = Gateway::start(&base, None).await;
     let server = tokio::spawn(async move {
@@ -164,11 +164,21 @@ async fn responses_and_chat_preserve_payload_status_and_safe_headers() {
             assert!(lower.contains("authorization: bearer upstream-secret\r\n"));
             assert!(lower.contains("openai-beta: responses=experimental\r\n"));
             assert!(lower.contains("x-request-id: forward-me\r\n"));
+            assert!(lower.contains("session-id: stable-session\r\n"));
+            assert!(lower.contains("x-client-request-id: stable-session\r\n"));
+            assert!(lower.contains("x-provider-future: first\r\n"));
+            assert!(lower.contains("x-provider-future: second\r\n"));
+            assert!(lower.contains("cookie: upstream-cookie=value\r\n"));
+            assert!(lower.contains("x-api-key: upstream-api-key\r\n"));
+            assert!(lower.contains("content-type: application/json\r\n"));
+            assert!(lower.contains("accept-encoding: identity\r\n"));
             for secret in [
                 "client-secret",
                 "private",
-                "cookie:",
                 "proxy-authorization:",
+                "x-hop-secret:",
+                "fumo.example.invalid",
+                "charset=utf-8",
             ] {
                 assert!(!lower.contains(secret), "{head}");
             }
@@ -203,11 +213,20 @@ async fn responses_and_chat_preserve_payload_status_and_safe_headers() {
     ] {
         let response = gateway
             .post(path, body)
-            .header("cookie", "private")
+            .header("cookie", "upstream-cookie=value")
             .header("proxy-authorization", "private")
-            .header("x-api-key", "private")
+            .header("x-api-key", "upstream-api-key")
+            .header("connection", "x-hop-secret")
+            .header("x-hop-secret", "private")
+            .header("host", "fumo.example.invalid")
+            .header("content-type", "application/json; charset=utf-8")
+            .header("accept-encoding", "gzip")
+            .header("x-provider-future", "first")
+            .header("x-provider-future", "second")
             .header("openai-beta", "responses=experimental")
             .header("x-request-id", "forward-me")
+            .header("session-id", "stable-session")
+            .header("x-client-request-id", "stable-session")
             .send()
             .await
             .unwrap();
