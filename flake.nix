@@ -22,6 +22,18 @@
         {
           default = package;
           fumo-gateway = package;
+          container = (pkgsFor system).dockerTools.buildLayeredImage {
+            name = "fumo-gateway";
+            tag = "latest";
+            contents = [ package ];
+            config = {
+              Entrypoint = [ "${package}/bin/fumo-gateway" ];
+              Env = [
+                "SSL_CERT_FILE=${(pkgsFor system).cacert}/etc/ssl/certs/ca-bundle.crt"
+                "HOME=/data"
+              ];
+            };
+          };
         }
       );
 

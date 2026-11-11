@@ -9,6 +9,27 @@ permissions:
     contents: read
 
 jobs:
+    container:
+        runs-on: ubuntu-latest
+        permissions:
+            packages: write
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+            - name: Build and push container
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RELEASE_TAG: ${{ github.ref_name }}
+                  GH_ACTOR: ${{ github.actor }}
+              run: |
+                  nix build .#container --out-link container-image
+                  docker load < container-image
+                  echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+                  docker tag fumo-gateway:latest "ghcr.io/sleroq/fumo-gateway:$RELEASE_TAG"
+                  docker tag fumo-gateway:latest ghcr.io/sleroq/fumo-gateway:latest
+                  docker push "ghcr.io/sleroq/fumo-gateway:$RELEASE_TAG"
+                  docker push ghcr.io/sleroq/fumo-gateway:latest
+
     linux-x64:
         runs-on: ubuntu-latest
         permissions:
