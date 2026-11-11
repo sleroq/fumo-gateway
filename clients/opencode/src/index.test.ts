@@ -13,6 +13,7 @@ import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { parseCatalog } from "../../catalog"
 import fixture from "../../../tests/fixtures/model-catalog.json"
 import plugin, { createFumoPlugin, setupFumo, type FumoContext } from "./index"
+import { constrainResponses } from "./responses"
 
 const baseURL = "http://localhost:8080/v1"
 const entries = await parseCatalog(Response.json(fixture))
@@ -172,6 +173,31 @@ async function nativeRequest(entry: typeof entries[number]) {
   if (!outgoing) throw new Error("Native transport did not send a request")
   return outgoing
 }
+
+test("legacy Responses constraints preserve native flat tools and existing instructions", async () => {
+  const legacy = {
+    ...fixture.data[0], id: "legacy/example",
+    request_constraints: { responses: {
+      ...entries[0].request_constraints!.responses, function_tools: "flat" as const, instructions: "You are a helpful assistant.",
+    } },
+  }
+  const [entry] = await parseCatalog(Response.json({ data: [legacy] }))
+  const constraints = entry.request_constraints!.responses
+  expect(constraints).toEqual(legacy.request_constraints.responses)
+  const outgoing = await nativeRequest(entry)
+  const before = await outgoing.clone().json()
+  const existing = await (await constrainResponses(outgoing.clone(), constraints)).json()
+  expect(existing.instructions).toBe(before.instructions)
+  const { instructions: _, ...withoutInstructions } = before
+  const request = new Request(outgoing, { body: JSON.stringify(withoutInstructions) })
+  const body = await (await constrainResponses(request, constraints)).json()
+  expect(body.instructions).toBe("You are a helpful assistant.")
+  expect(body.tools).toEqual(before.tools)
+  expect(body.input).toEqual(before.input)
+  for (const field of constraints.omit) expect(body).not.toHaveProperty(field)
+  const supplied = new Request(baseURL, { method: "POST", body: JSON.stringify({ instructions: "Existing instructions" }) })
+  expect((await (await constrainResponses(supplied, constraints)).json()).instructions).toBe("Existing instructions")
+})
 
 test("actual native Responses and Completions wire requests follow advertised constraints, not namespaces", async () => {
   network()

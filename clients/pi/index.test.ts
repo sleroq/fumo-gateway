@@ -75,6 +75,7 @@ test("login saves the gateway URL for discovery and both native adapters after r
     input: ["text", "image"], reasoning: true,
   });
   expect(getSupportedThinkingLevels(model)).toEqual(["low", "high"]);
+  expect(model.samplingParams).toBeUndefined();
   expect(restarted.getModel("fumo", "personal/future")).toMatchObject({
     contextWindow: 128000, maxTokens: 16384, input: ["text"], reasoning: false,
   });
@@ -161,6 +162,30 @@ test("constrained native Responses keeps full IDs, tools, and top-level effort",
   expect(alias.max_output_tokens).toBeUndefined();
   expect(alias.reasoning.effort).toBe("high");
   expect(alias.input).toContainEqual(expect.objectContaining({ type: "additional_tools" }));
+});
+
+test("legacy Responses metadata drives native flat tools and instructions", async () => {
+  const legacy = {
+    ...gatewayCatalog.data[0], id: "legacy/example",
+    request_constraints: { responses: {
+      ...entries[0].request_constraints!.responses, function_tools: "flat" as const, instructions: "You are a helpful assistant.",
+    } },
+  };
+  const [parsed] = await parseCatalog(Response.json({ data: [legacy] }));
+  expect(parsed.request_constraints?.responses).toEqual(legacy.request_constraints.responses);
+  const { runtime } = await createRuntime();
+  await login(runtime);
+  spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [legacy] }));
+  expect((await runtime.refresh(refresh)).errors.size).toBe(0);
+  const model = runtime.getModel("fumo", legacy.id)!;
+  expect(model.samplingParams).toEqual({ instructions: "You are a helpful assistant." });
+  expect(model.compat).toMatchObject({ supportsAdditionalTools: false, supportsMidConvoSystemMessages: false, supportsMidConvoEffort: false });
+  const { payload } = await nativeRequest(runtime, legacy.id);
+  expect(payload.instructions).toBe("You are a helpful assistant.");
+  expect(payload.tools).toContainEqual(expect.objectContaining({ name: "fixture_read", type: "function" }));
+  expect(payload.input).toContainEqual(expect.objectContaining({ role: "developer" }));
+  expect(payload.input.some((item: { type?: string }) => item.type === "additional_tools" || item.type === "configuration_update")).toBe(false);
+  for (const field of legacy.request_constraints.responses.omit) expect(payload).not.toHaveProperty(field);
 });
 
 test("compaction summarizes with the Sign in with ChatGPT model without unsupported cache options", async () => {

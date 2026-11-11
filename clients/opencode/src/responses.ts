@@ -9,7 +9,8 @@ const FunctionTool = Schema.StructWithRest(Schema.Struct({ type: Schema.Literals
 export async function constrainResponses(request: Request, constraints: ResponsesConstraints): Promise<Request> {
   const body = { ...Schema.decodeUnknownSync(JsonObject)(await request.json()) }
   for (const field of constraints.omit) delete body[field]
-  if (Array.isArray(body.tools) && Array.isArray(body.input)) {
+  if (constraints.instructions !== undefined && body.instructions === undefined) body.instructions = constraints.instructions
+  if (constraints.function_tools === "namespaced-or-additional" && Array.isArray(body.tools) && Array.isArray(body.input)) {
     const functions = body.tools.filter(Schema.is(FunctionTool))
     if (functions.length) {
       body.input = [{ type: "additional_tools", role: "developer", tools: functions }, ...body.input]

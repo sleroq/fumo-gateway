@@ -44,12 +44,16 @@ pub(crate) enum ProviderAuth {
 }
 
 impl Provider {
-    pub(crate) async fn authorization(&self) -> anyhow::Result<Option<String>> {
+    pub(crate) async fn headers(&self) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
         match &self.config.auth {
-            ProviderAuth::None => Ok(None),
-            ProviderAuth::ApiKey(key) => Ok(Some(format!("Bearer {key}"))),
-            ProviderAuth::Codex(session) => Ok(Some(session.authorization().await?)),
+            ProviderAuth::None => {}
+            ProviderAuth::ApiKey(key) => {
+                headers.insert(header::AUTHORIZATION, format!("Bearer {key}").parse()?);
+            }
+            ProviderAuth::Codex(session) => return session.headers().await,
         }
+        Ok(headers)
     }
 }
 
@@ -60,16 +64,22 @@ impl Gateway {
         let mut accounts = Vec::new();
         let mut providers = Vec::new();
         for upstream in config.upstreams {
+            let legacy = matches!(upstream.auth, Auth::CodexLegacy(_));
             let auth = match upstream.auth {
                 Auth::None => ProviderAuth::None,
                 Auth::ApiKey(key) => ProviderAuth::ApiKey(key),
-                Auth::Codex(directory) => {
+                Auth::Codex(directory) | Auth::CodexLegacy(directory) => {
                     let directory = absolute_path(&directory)?;
-                    let session = if let Some(session) = sessions.get(&directory) {
+                    let key = (directory.clone(), legacy);
+                    let session = if let Some(session) = sessions.get(&key) {
                         Arc::clone(session)
                     } else {
-                        let session = Session::load(directory.clone(), http.clone())?;
-                        sessions.insert(directory, Arc::clone(&session));
+                        let session = if legacy {
+                            Session::load_legacy(directory, http.clone())?
+                        } else {
+                            Session::load(directory, http.clone())?
+                        };
+                        sessions.insert(key, Arc::clone(&session));
                         accounts.push(Account {
                             id: upstream.name.clone(),
                             configured: true,
@@ -216,8 +226,8 @@ async fn forward(gateway: &Gateway, request: Request<Body>, path: &str) -> Respo
         Ok(value) => value,
         Err(reason) => return error(StatusCode::BAD_REQUEST, reason),
     };
-    let authorization = match provider.authorization().await {
-        Ok(authorization) => authorization,
+    let auth_headers = match provider.headers().await {
+        Ok(headers) => headers,
         Err(_) => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -236,12 +246,7 @@ async fn forward(gateway: &Gateway, request: Request<Body>, path: &str) -> Respo
             outgoing = outgoing.header(name, value);
         }
     }
-    if let Some(authorization) = authorization {
-        outgoing = outgoing.header(header::AUTHORIZATION, authorization);
-    }
-    if matches!(provider.config.auth, ProviderAuth::Codex(_)) {
-        outgoing = outgoing.header(header::USER_AGENT, "fumo-gateway");
-    }
+    outgoing = outgoing.headers(auth_headers);
     let upstream = match outgoing.send().await {
         Ok(response) => response,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "bad_gateway"),
@@ -365,6 +370,109 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn legacy_inference_uses_its_session_and_replaces_caller_account_headers() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account"}}"#
+            )
+        );
+        std::fs::write(
+            directory.path().join("codex-legacy.json"),
+            json!({
+                "device_id":"", "access_token":token, "expires_at":4102444800_i64
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (mut gateway, _admin) = Gateway::new(Config {
+            listen: "127.0.0.1:8080".parse().unwrap(),
+            clients: Vec::new(),
+            admin: None,
+            admin_directory: None,
+            proxy: None,
+            upstreams: vec![
+                Upstream {
+                    name: "siwc".into(),
+                    base_url: "https://api.openai.com/v1".into(),
+                    aliases: Default::default(),
+                    auth: Auth::Codex(directory.path().into()),
+                },
+                Upstream {
+                    name: "legacy".into(),
+                    base_url: "https://chatgpt.com/backend-api/codex".into(),
+                    aliases: Default::default(),
+                    auth: Auth::CodexLegacy(directory.path().into()),
+                },
+            ],
+        })
+        .unwrap();
+        let ProviderAuth::Codex(siwc) = &gateway.providers[0].config.auth else {
+            panic!("missing SIWC session")
+        };
+        let ProviderAuth::Codex(legacy) = &gateway.providers[1].config.auth else {
+            panic!("missing legacy session")
+        };
+        assert!(!Arc::ptr_eq(siwc, legacy));
+        assert_eq!(siwc.status().await.status, "login_required");
+        assert_eq!(legacy.status().await.status, "connected");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!(
+            "http://{}/backend-api/codex",
+            listener.local_addr().unwrap()
+        );
+        Arc::get_mut(&mut gateway).unwrap().providers[1]
+            .config
+            .base_url = base_url;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("POST /backend-api/codex/responses HTTP/1.1\r\n"));
+            assert!(head.contains(&format!("authorization: Bearer {token}\r\n")));
+            assert!(head.contains("chatgpt-account-id: test-account\r\n"));
+            assert!(head.contains("originator: fumo-gateway\r\n"));
+            assert!(head.contains("openai-beta: responses=experimental\r\n"));
+            assert!(!head.contains("spoofed"));
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                json!({"model":"gpt-test","instructions":"custom","input":[],"stream":true,"store":false})
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let request = Request::builder().method(Method::POST)
+            .header("authorization", "Bearer spoofed")
+            .header("chatgpt-account-id", "spoofed")
+            .header("originator", "spoofed")
+            .header("openai-beta", "spoofed")
+            .body(Body::from(json!({"model":"legacy/gpt-test","instructions":"custom","input":[],"stream":true,"store":false}).to_string())).unwrap();
+        let response = forward(&gateway, request, "/responses").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body(), 100).await.unwrap(), "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn runtime_auth_preserves_authorization() {
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -390,7 +498,13 @@ mod tests {
                 },
                 cache: Mutex::default(),
             };
-            assert_eq!(provider.authorization().await.unwrap().as_deref(), expected);
+            let headers = provider.headers().await.unwrap();
+            assert_eq!(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap()),
+                expected
+            );
         }
     }
 }

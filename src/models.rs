@@ -26,7 +26,6 @@ pub(crate) async fn list(gateway: &Gateway) -> Result<Value> {
         available |= native.is_some() || !provider.config.aliases.is_empty();
         let native = native.unwrap_or_default();
         let owner = &provider.config.name;
-        let siwc = matches!(provider.config.auth, ProviderAuth::Codex(_));
         let mut models = Vec::new();
         for (alias, target) in &provider.config.aliases {
             let target = format!("{owner}/{target}");
@@ -40,7 +39,7 @@ pub(crate) async fn list(gateway: &Gateway) -> Result<Value> {
         }
         models.extend(native);
         for model in models {
-            let model = with_constraints(model, siwc);
+            let model = with_constraints(model, &provider.config.auth);
             let id = model["id"]
                 .as_str()
                 .expect("normalized model ID")
@@ -56,15 +55,11 @@ pub(crate) async fn list(gateway: &Gateway) -> Result<Value> {
 
 async fn snapshot(provider: &Provider, http: &reqwest::Client) -> Option<Vec<Value>> {
     // Keep authorization outside the cache lock, like inference/session callers.
-    let authorization = provider.authorization().await;
+    let headers = provider.headers().await;
     let mut cache = provider.cache.lock().await;
     let now = Instant::now();
     if cache.next_refresh.is_none_or(|next| now >= next) {
-        let result = async {
-            let authorization = authorization?;
-            discover(http, &provider.config, authorization).await
-        }
-        .await;
+        let result = async { discover(http, &provider.config, headers?).await }.await;
         let delay = match result {
             Ok(models) => {
                 cache.models = Some(models);
@@ -86,18 +81,18 @@ async fn snapshot(provider: &Provider, http: &reqwest::Client) -> Option<Vec<Val
 async fn discover(
     http: &reqwest::Client,
     upstream: &config::Upstream<ProviderAuth>,
-    authorization: Option<String>,
+    headers: reqwest::header::HeaderMap,
 ) -> Result<Vec<Value>> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let siwc = matches!(upstream.auth, ProviderAuth::Codex(_));
         let mut request = http
             .get(format!("{}/models", upstream.base_url))
-            .header(reqwest::header::ACCEPT_ENCODING, "identity");
-        if let Some(authorization) = authorization {
-            request = request.header(reqwest::header::AUTHORIZATION, authorization);
-        }
-        if siwc {
-            request = request.header(reqwest::header::USER_AGENT, "fumo-gateway");
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .headers(headers);
+        if let ProviderAuth::Codex(session) = &upstream.auth
+            && session.is_legacy()
+        {
+            request = request.query(&[("client_version", env!("CARGO_PKG_VERSION"))]);
         }
         let response = request.send().await?;
         ensure!(
@@ -179,10 +174,10 @@ fn parse(body: &[u8], owner: &str, siwc: bool) -> Result<Vec<Value>> {
     Ok(models)
 }
 
-fn with_constraints(model: Value, siwc: bool) -> Value {
-    if !siwc {
+fn with_constraints(model: Value, auth: &ProviderAuth) -> Value {
+    let ProviderAuth::Codex(session) = auth else {
         return model;
-    }
+    };
     let mut object = Map::new();
     for (key, value) in model.as_object().expect("normalized model") {
         if !["id", "object", "owned_by", "name", "created"].contains(&key.as_str()) {
@@ -190,11 +185,16 @@ fn with_constraints(model: Value, siwc: bool) -> Value {
         }
         object.insert(key.clone(), value.clone());
     }
-    object.insert("request_constraints".into(), json!({"responses": {
+    let mut constraints = json!({"responses": {
         "omit": ["background", "conversation", "max_output_tokens", "max_tool_calls", "metadata", "moderation", "multi_agent", "prompt", "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "temperature", "top_logprobs", "top_p", "truncation", "user", "previous_response_id"],
         "function_tools": "namespaced-or-additional",
         "unsupported_tools": ["image_generation", "file_search", "code_interpreter", "computer_use_preview", "mcp", "tool_search", "programmatic_tool_calling"]
-    }}));
+    }});
+    if session.is_legacy() {
+        constraints["responses"]["function_tools"] = json!("flat");
+        constraints["responses"]["instructions"] = json!("You are a helpful assistant.");
+    }
+    object.insert("request_constraints".into(), constraints);
     for (key, value) in model.as_object().expect("normalized model") {
         if !object.contains_key(key) {
             object.insert(key.clone(), value.clone());
@@ -208,56 +208,92 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn discovers_siwc_catalog_with_persisted_session() {
+    async fn discovers_chatgpt_catalog_with_persisted_session() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let body = br#"{"models":[{"slug":"gpt-6.1-sol","display_name":"Personal Codex","visibility":"list","context_window":272000,"max_output_tokens":16000,"input_modalities":["text","image"],"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high","description":"Thorough"}],"supports_parallel_tool_calls":false,"request_constraints":{"spoofed":true}},{"slug":"hidden","display_name":"Hidden","visibility":"hidden"}]}"#;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                request.push(socket.read_u8().await.unwrap());
-            }
-            let request = String::from_utf8(request).unwrap().to_lowercase();
-            assert!(request.starts_with("get /models http/1.1\r\n"));
-            assert!(request.contains("authorization: bearer personal-token\r\n"));
-            assert!(request.contains("user-agent: fumo-gateway\r\n"));
-            socket.write_all(format!(
+        for legacy in [false, true] {
+            let token = if legacy {
+                format!(
+                    "header.{}.signature",
+                    URL_SAFE_NO_PAD.encode(
+                        br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account"}}"#
+                    )
+                )
+            } else {
+                "personal-token".into()
+            };
+            let expected_token = token.clone();
+            let body = br#"{"models":[{"slug":"gpt-6.1-sol","display_name":"Personal Codex","visibility":"list","context_window":272000,"max_output_tokens":16000,"input_modalities":["text","image"],"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high","description":"Thorough"}],"supports_parallel_tool_calls":false,"request_constraints":{"spoofed":true}},{"slug":"hidden","display_name":"Hidden","visibility":"hidden"}]}"#;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_lowercase();
+                let path = if legacy {
+                    concat!("/models?client_version=", env!("CARGO_PKG_VERSION"))
+                } else {
+                    "/models"
+                };
+                assert!(request.starts_with(&format!("get {path} http/1.1\r\n")));
+                assert!(request.contains(&format!(
+                    "authorization: bearer {}\r\n",
+                    expected_token.to_lowercase()
+                )));
+                assert!(request.contains("user-agent: fumo-gateway\r\n"));
+                if legacy {
+                    assert!(request.contains("chatgpt-account-id: test-account\r\n"));
+                    assert!(request.contains("originator: fumo-gateway\r\n"));
+                }
+                socket.write_all(format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             ).as_bytes()).await.unwrap();
-            socket.write_all(body).await.unwrap();
-        });
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            directory.path().join("codex.json"),
-            br#"{"device_id":"host","client_id":"client","access_token":"personal-token","expires_at":4102444800}"#,
+                socket.write_all(body).await.unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+            directory.path().join(if legacy { "codex-legacy.json" } else { "codex.json" }),
+            json!({"device_id":"host","client_id":"client","access_token":token,"expires_at":4102444800_i64}).to_string(),
         ).unwrap();
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let session = crate::codex::Session::load(directory.path().into(), http.clone()).unwrap();
-        let gateway = Gateway {
-            clients: Vec::new(),
-            providers: vec![Provider {
-                config: config::Upstream {
-                    name: "personal".into(),
-                    base_url: format!("http://{address}"),
-                    aliases: Default::default(),
-                    auth: ProviderAuth::Codex(session),
-                },
-                cache: tokio::sync::Mutex::new(Cache::default()),
-            }],
-            http,
-        };
-        let catalog = list(&gateway).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(catalog["data"].as_array().unwrap().len(), 1);
-        let fixture: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/model-catalog.json")).unwrap();
-        assert_eq!(
-            serde_json::to_string(&catalog["data"][0]).unwrap(),
-            serde_json::to_string(&fixture["data"][2]).unwrap()
-        );
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let session = if legacy {
+                crate::codex::Session::load_legacy(directory.path().into(), http.clone()).unwrap()
+            } else {
+                crate::codex::Session::load(directory.path().into(), http.clone()).unwrap()
+            };
+            let gateway = Gateway {
+                clients: Vec::new(),
+                providers: vec![Provider {
+                    config: config::Upstream {
+                        name: "personal".into(),
+                        base_url: format!("http://{address}"),
+                        aliases: Default::default(),
+                        auth: ProviderAuth::Codex(session),
+                    },
+                    cache: tokio::sync::Mutex::new(Cache::default()),
+                }],
+                http,
+            };
+            let catalog = list(&gateway).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(catalog["data"].as_array().unwrap().len(), 1);
+            let mut fixture: Value =
+                serde_json::from_str(include_str!("../tests/fixtures/model-catalog.json")).unwrap();
+            if legacy {
+                fixture["data"][2]["request_constraints"]["responses"]["function_tools"] =
+                    json!("flat");
+                fixture["data"][2]["request_constraints"]["responses"]["instructions"] =
+                    json!("You are a helpful assistant.");
+            }
+            assert_eq!(
+                serde_json::to_string(&catalog["data"][0]).unwrap(),
+                serde_json::to_string(&fixture["data"][2]).unwrap()
+            );
+        }
     }
 }

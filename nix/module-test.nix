@@ -28,6 +28,10 @@ let
       listen = "127.0.0.1:9000";
       proxy_env = "FUMO_PROXY";
       clients.test.key_env = "FUMO_TEST_KEY";
+      upstreams.legacy = {
+        base_url = "https://chatgpt.com/backend-api/codex";
+        auth.provider = "codex_legacy";
+      };
     };
   };
   cfg = configured.services.fumo-gateway;
@@ -69,7 +73,9 @@ pkgs.runCommand "fumo-gateway-module-test" { nativeBuildInputs = [ pkgs.jq ]; } 
   jq -e '
     .listen == "127.0.0.1:9000" and
     .proxy_env == "FUMO_PROXY" and
-    .clients.test.key_env == "FUMO_TEST_KEY"
+    .clients.test.key_env == "FUMO_TEST_KEY" and
+    .upstreams.legacy.base_url == "https://chatgpt.com/backend-api/codex" and
+    .upstreams.legacy.auth.provider == "codex_legacy"
   ' ${cfg.configFile}
   jq -e '.proxy_env == null' ${defaults.services.fumo-gateway.configFile}
   mkdir -p "$out"

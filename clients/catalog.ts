@@ -8,8 +8,9 @@ const number = optional(Type.Number());
 const modalities = optional(Type.Array(Type.String()));
 export const ResponsesConstraints = Type.Object({
   omit: Type.Array(Type.String()),
-  function_tools: Type.Literal("namespaced-or-additional"),
+  function_tools: Type.Union([Type.Literal("namespaced-or-additional"), Type.Literal("flat")]),
   unsupported_tools: Type.Array(Type.String()),
+  instructions: Type.Optional(Type.String()),
 });
 export type ResponsesConstraints = Static<typeof ResponsesConstraints>;
 
