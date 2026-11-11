@@ -474,7 +474,7 @@ async fn disconnect_cancels_upstream_without_interrupting_another_stream() {
 }
 
 #[tokio::test]
-async fn loopback_admin_http_separates_keys_and_enforces_browser_sessions() {
+async fn admin_http_separates_keys_and_enforces_browser_sessions() {
     let (_origin, base) = listener().await;
     let gateway = Gateway::start(&base, None).await;
     let accounts = format!("{}/admin/api/accounts", gateway.url);

@@ -152,11 +152,7 @@ pub(crate) async fn serve(config: Config) -> anyhow::Result<()> {
         .await
         .context("listen failed")?;
     eprintln!("event=server_started address={listen}");
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 

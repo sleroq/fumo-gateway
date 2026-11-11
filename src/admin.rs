@@ -1,13 +1,12 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
 use axum::{
     Router,
     body::{Body, to_bytes},
-    extract::{ConnectInfo, Request, State},
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
@@ -178,14 +177,7 @@ fn asset(headers: &HeaderMap, bytes: &'static [u8], content_type: &'static str) 
     result
 }
 
-async fn handle(
-    State(admin): State<Arc<Admin>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    request: Request,
-) -> Response {
-    if !peer.ip().is_loopback() {
-        return error(StatusCode::FORBIDDEN, "loopback_required");
-    }
+async fn handle(State(admin): State<Arc<Admin>>, request: Request) -> Response {
     let path = request.uri().path().to_owned();
     let method = request.method();
     let headers = request.headers();
