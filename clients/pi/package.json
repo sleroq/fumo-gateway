@@ -1,14 +1,26 @@
 {
   "name": "@fumo-gateway/pi",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Fumo gateway model discovery for Pi's native OpenAI adapters",
   "type": "module",
-  "keywords": ["pi-package", "fumo"],
-  "files": ["dist"],
+  "keywords": [
+    "pi-package",
+    "fumo"
+  ],
+  "files": [
+    "dist"
+  ],
   "exports": {
-    ".": { "types": "./dist/pi/index.d.ts", "default": "./dist/index.js" }
+    ".": {
+      "types": "./dist/pi/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
-  "pi": { "extensions": ["./dist/index.js"] },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
   "scripts": {
     "build": "bun ../build.ts pi",
     "prepack": "bun run build"
@@ -18,5 +30,7 @@
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }
