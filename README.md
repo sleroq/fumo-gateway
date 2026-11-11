@@ -2,60 +2,65 @@
 
 # fumo-gateway
 
-Headless LLM gateway with named upstreams, model discovery, and Sign in with ChatGPT.
-Forwards native OpenAI Responses and Chat Completions requests; no protocol translation.
+LLM gateway with named upstreams, model discovery. 
+
+Forwards native OpenAI Responses and Chat Completions requests without any protocol translation.
+
+Providers support:
+- OpenAI (Both SWCG and Codex auth)
+- Opencode zen / go
+- Any other openai-compatible api with token-based auth
 
 ## Quick start
 
-Requires **Rust** and **Bun** (`nix develop`). Copy
-[`gateway.example.json`](gateway.example.json), remove unused upstreams, and set
-the provider API keys referenced by your configuration.
+Clone this repository, copy [`gateway.example.json`](gateway.example.json) to
+`gateway.json`, and remove unused upstreams. Create a `.env` file with your
+client, admin, and any configured provider keys:
 
 ```sh
-bun install --cwd web --frozen-lockfile
-cp gateway.example.json gateway.json
-export FUMO_PI_KEY="$(openssl rand -hex 32)"
-export FUMO_ADMIN_KEY="$(openssl rand -hex 32)"
-cargo build --release
-./target/release/fumo-gateway --config gateway.json
+printf 'FUMO_PI_KEY=%s\nFUMO_ADMIN_KEY=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+```
+
+Start with Nix:
+
+```sh
+set -a; . ./.env; set +a
+nix run github:sleroq/fumo-gateway -- --config gateway.json
+```
+
+Or, for Docker Compose, set `"listen": "0.0.0.0:8080"` in `gateway.json`
+so the gateway accepts connections inside the container, then run:
+
+```sh
+docker compose up -d
 ```
 
 For ChatGPT, open **http://127.0.0.1:8080/admin/**, unlock with `FUMO_ADMIN_KEY`.
-For remote administration, use an SSH tunnel; do not expose admin access over plaintext HTTP.
+
+Use an SSH tunnel to access UI if you want to run fumo-gateway on the server; do not expose admin access. It is secure, but I would still avoid this as a practice.
 
 Point your client at `http://127.0.0.1:8080/v1` with `FUMO_PI_KEY` as its bearer key.
 
 ## Outbound proxy
 
-Set `"proxy_env": "FUMO_PROXY"` in your configuration and export
-`FUMO_PROXY=http://127.0.0.1:8081` (or `socks5://127.0.0.1:1080`), then restart.
-Omit `proxy_env` for direct connections; conventional proxy variables are ignored.
-
-## Nix
-
-```sh
-nix run github:sleroq/fumo-gateway
-```
+You can configure gateway to proxy all requests via http or socks5 proxy by setting `"proxy_env": "FUMO_PROXY"` in your configuration and exporting `FUMO_PROXY=http://127.0.0.1:8081` (or `socks5://127.0.0.1:1080`) env
 
 For NixOS, use the [included module](nix/README.md).
 
 ## Client plugins
 
-The plugins discover available models and configure native adapters from Fumo's
-metadata, including Sign in with ChatGPT request restrictions. They are optional:
-any OpenAI-compatible client can use the gateway URL and client API key directly,
-with model IDs and request options configured manually.
+For ease of use in opencode and pi - use plugins. They automatically get the model information from the upstream providers and set all necessary capabilities, registering fumo as a provider automatically.
 
-Authenticate with a **gateway client API key** (`FUMO_PI_KEY` in the quick start), not the admin key or upstream tokens.
+They are optional: any OpenAI-compatible client can use the gateway URL and client API key directly,
+with model IDs and request options configured manually.
 
 ### Pi
 
 ```sh
 pi install npm:@fumo-gateway/pi
-pi
 ```
 
-Run `/login fumo`, enter the gateway URL (including `/v1`) and client key.
+Run `/login fumo`
 
 ### OpenCode
 
@@ -70,14 +75,15 @@ Add to `opencode.json`:
 }
 ```
 
-Restart OpenCode, run `/connect`, choose **Fumo Gateway**, and enter the client key.
-Select a model with `/models`. Models refresh at startup and on account switches;
-restart OpenCode to retry discovery or pick up gateway catalog changes.
+Restart OpenCode, run `/connect`, choose **Fumo Gateway**
 
 ## Development
 
 Run `cargo test` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+
 The Rust build embeds the admin UI and runs the frontend build with Bun.
+
+
 Frontend checks: `bun run --cwd web lint`, `typecheck`, and `test` (each as a separate script).
 For frontend development, run the gateway and `bun run --cwd web dev`.
 
