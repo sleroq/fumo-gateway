@@ -1,0 +1,45 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "**"
+
+permissions:
+    contents: read
+
+jobs:
+    linux-x64:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+            - name: Install Rust and musl toolchain
+              run: |
+                  rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+                  sudo apt-get update
+                  sudo apt-get install --yes musl-tools
+
+            - name: Install frontend dependencies
+              run: bun install --cwd web --frozen-lockfile
+
+            - name: Build Linux x64 binary
+              env:
+                  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+              run: cargo +stable build --release --locked --target x86_64-unknown-linux-musl
+
+            - name: Package binary
+              run: |
+                  tar -czf fumo-gateway-linux-x64.tar.gz -C target/x86_64-unknown-linux-musl/release fumo-gateway
+                  sha256sum fumo-gateway-linux-x64.tar.gz > SHA256SUMS
+
+            - name: Publish GitHub release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RELEASE_TAG: ${{ github.ref_name }}
+              run: |
+                  gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+                      fumo-gateway-linux-x64.tar.gz SHA256SUMS
