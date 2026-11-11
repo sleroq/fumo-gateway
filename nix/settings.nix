@@ -59,7 +59,8 @@ in
               example = "https://api.openai.com/v1";
               description = ''
                 HTTP(S) API root without userinfo, query, or fragment. Codex
-                authentication requires https://api.openai.com/v1.
+                authentication requires https://api.openai.com/v1; codex_legacy
+                requires https://chatgpt.com/backend-api/codex.
               '';
             };
 
@@ -79,16 +80,17 @@ in
                     provider = mkOption {
                       type = types.enum [
                         "codex"
+                        "codex_legacy"
                         "api_key"
                       ];
-                      description = "Use Sign in with ChatGPT (codex) or an API key from the environment (api_key).";
+                      description = "Use Sign in with ChatGPT (codex), legacy Codex OAuth (codex_legacy), or an API key from the environment (api_key).";
                     };
 
                     key_env = mkOption {
                       type = types.nullOr types.nonEmptyStr;
                       default = null;
                       example = "OPENAI_API_KEY";
-                      description = "Environment variable containing the upstream API key. Required for api_key; must be null for codex.";
+                      description = "Environment variable containing the upstream API key. Required for api_key; must be null for codex and codex_legacy.";
                     };
 
                     credentials_dir = mkOption {
@@ -96,7 +98,7 @@ in
                       default = null;
                       example = "/var/lib/fumo-gateway/credentials";
                       description = ''
-                        Private OAuth credential directory for codex. Null uses
+                        Private OAuth credential directory for codex or codex_legacy. Null uses
                         the gateway's default state directory; relative paths
                         resolve from /var/lib/fumo-gateway. Must be null for api_key.
                       '';

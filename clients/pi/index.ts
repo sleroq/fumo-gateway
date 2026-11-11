@@ -40,8 +40,8 @@ export function toPiModel(entry: CatalogEntry, baseUrl: string): Model<"openai-r
     if (metadata.constraints.omit.includes("prompt_cache_options")) compat.supportsExplicitPromptCacheMode = false;
     if (metadata.constraints.omit.includes("prompt_cache_retention")) compat.supportsLongCacheRetention = false;
     // Pi needs both flags to place function tools in native additional_tools items.
-    compat.supportsAdditionalTools = true;
-    compat.supportsMidConvoSystemMessages = true;
+    compat.supportsAdditionalTools = metadata.constraints.function_tools === "namespaced-or-additional";
+    compat.supportsMidConvoSystemMessages = metadata.constraints.function_tools === "namespaced-or-additional";
     // SIWC rejects configuration_update input items even when the native model supports them.
     compat.supportsMidConvoEffort = false;
     if (metadata.constraints.unsupported_tools.includes("tool_search")) compat.supportsToolSearch = false;
@@ -59,6 +59,7 @@ export function toPiModel(entry: CatalogEntry, baseUrl: string): Model<"openai-r
     contextWindow: metadata.context ?? 128000,
     maxTokens: metadata.output ?? 16384,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...(metadata.constraints?.instructions !== undefined && { samplingParams: { instructions: metadata.constraints.instructions } }),
     compat,
   };
 }

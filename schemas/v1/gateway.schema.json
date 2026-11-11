@@ -18,7 +18,7 @@
             "examples": ["127.0.0.1:8080", "[::1]:8080"]
         },
         "proxy_env": {
-            "description": "Environment variable containing the outbound proxy URL, never the URL or credentials themselves. Omit or use null for direct connections; HTTP_PROXY and similar variables are not inferred. Supports http://[user:password@]host:port or socks5://[user:password@]host:port with an explicit port and an empty or / path. Destination DNS is resolved locally; socks5h and HTTPS-to-proxy are unsupported. Applies to gateway-originated inference, model discovery, and SIWC code exchange and refresh, not browser login navigation. Destination HTTPS certificate verification is unchanged.",
+            "description": "Environment variable containing the outbound proxy URL, never the URL or credentials themselves. Omit or use null for direct connections; HTTP_PROXY and similar variables are not inferred. Supports http://[user:password@]host:port or socks5://[user:password@]host:port with an explicit port and an empty or / path. Destination DNS is resolved locally; socks5h and HTTPS-to-proxy are unsupported. Applies to gateway-originated inference, model discovery, and OAuth code exchange and refresh, not browser login navigation. Destination HTTPS certificate verification is unchanged.",
             "anyOf": [{ "$ref": "#/definitions/keyEnv" }, { "type": "null" }]
         },
         "admin": {
@@ -77,7 +77,7 @@
                     "additionalProperties": { "type": "string", "minLength": 1 }
                 },
                 "auth": {
-                    "description": "Omit or use null for no authentication. Choose Sign in with ChatGPT or an API key from the environment.",
+                    "description": "Omit or use null for no authentication. Choose Sign in with ChatGPT, legacy Codex OAuth, or an API key from the environment.",
                     "oneOf": [
                         { "type": "null" },
                         { "$ref": "#/definitions/codexAuth" },
@@ -102,7 +102,27 @@
                             "base_url": {
                                 "type": "string",
                                 "pattern": "^https://api\\.openai\\.com/v1/*$",
-                                "description": "ChatGPT credentials may only be sent to https://api.openai.com/v1."
+                                "description": "SIWC credentials may only be sent to https://api.openai.com/v1."
+                            }
+                        }
+                    }
+                },
+                {
+                    "if": {
+                        "required": ["auth"],
+                        "properties": {
+                            "auth": {
+                                "type": "object",
+                                "required": ["provider"],
+                                "properties": { "provider": { "const": "codex_legacy" } }
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "base_url": {
+                                "type": "string",
+                                "pattern": "^https://chatgpt\\.com/backend-api/codex/*$"
                             }
                         }
                     }
@@ -115,7 +135,7 @@
             "additionalProperties": false,
             "required": ["provider"],
             "properties": {
-                "provider": { "const": "codex" },
+                "provider": { "enum": ["codex", "codex_legacy"] },
                 "credentials_dir": {
                     "type": ["string", "null"],
                     "pattern": "[^ \\t\\r\\n]",

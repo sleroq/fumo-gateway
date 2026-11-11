@@ -9,7 +9,7 @@ import {
 
 type Account = {
     id: string;
-    provider: "codex";
+    provider: "codex" | "codex_legacy";
     status: "connected" | "login_required";
     configured: boolean;
 };

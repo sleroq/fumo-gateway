@@ -19,6 +19,8 @@ use tokio::{
 
 const ORIGIN: &str = "https://auth.openai.com";
 const REDIRECT: &str = "http://127.0.0.1:1455/auth/callback";
+const LEGACY_REDIRECT: &str = "http://localhost:1455/auth/callback";
+const LEGACY_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const RESOURCE: &str = "https://api.openai.com/v1";
 const SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 
@@ -83,6 +85,7 @@ pub struct Session {
     directory: PathBuf,
     client: reqwest::Client,
     origin: String,
+    legacy: bool,
     state: Mutex<State>,
     refreshed: Notify,
     login: Mutex<()>,
@@ -113,7 +116,19 @@ impl std::error::Error for AuthError {}
 impl Session {
     /// The caller supplies the shared client, including proxy and redirect policy.
     pub fn load(directory: PathBuf, client: reqwest::Client) -> Result<Arc<Self>> {
-        let credentials = match fs::read(directory.join("codex.json")) {
+        Self::load_flow(directory, client, false)
+    }
+
+    pub fn load_legacy(directory: PathBuf, client: reqwest::Client) -> Result<Arc<Self>> {
+        Self::load_flow(directory, client, true)
+    }
+
+    fn load_flow(directory: PathBuf, client: reqwest::Client, legacy: bool) -> Result<Arc<Self>> {
+        let credentials = match fs::read(directory.join(if legacy {
+            "codex-legacy.json"
+        } else {
+            "codex.json"
+        })) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Credentials::default(),
             Err(error) => return Err(error.into()),
@@ -122,6 +137,7 @@ impl Session {
             directory,
             client,
             origin: ORIGIN.into(),
+            legacy,
             state: Mutex::new(State {
                 credentials,
                 pending: None,
@@ -132,6 +148,45 @@ impl Session {
             refreshed: Notify::new(),
             login: Mutex::new(()),
         }))
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.legacy
+    }
+
+    pub async fn headers(self: &Arc<Self>) -> Result<reqwest::header::HeaderMap> {
+        use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+        let authorization = self.authorization().await?;
+        let mut headers = HeaderMap::new();
+        if self.legacy {
+            let token = authorization
+                .strip_prefix("Bearer ")
+                .ok_or_else(|| anyhow!("InvalidCredentials"))?;
+            headers.insert(
+                "chatgpt-account-id",
+                HeaderValue::from_str(&account_id(token)?)?,
+            );
+            headers.insert("originator", HeaderValue::from_static("fumo-gateway"));
+            headers.insert(
+                "openai-beta",
+                HeaderValue::from_static("responses=experimental"),
+            );
+        }
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&authorization)?);
+        headers.insert(USER_AGENT, HeaderValue::from_static("fumo-gateway"));
+        Ok(headers)
+    }
+
+    fn redirect(&self) -> &'static str {
+        if self.legacy {
+            LEGACY_REDIRECT
+        } else {
+            REDIRECT
+        }
+    }
+
+    fn save(&self, credentials: &Credentials) -> Result<()> {
+        save(&self.directory, credentials, self.legacy)
     }
 
     /// Refresh valid tokens in the background; wait for refresh after expiry.
@@ -194,10 +249,19 @@ impl Session {
             } else {
                 saved.device_id.clone()
             },
-            client_id: saved.client_id.clone(),
+            client_id: if self.legacy {
+                LEGACY_CLIENT_ID.into()
+            } else {
+                saved.client_id.clone()
+            },
             expires: Instant::now() + Duration::from_secs(300),
         };
-        let mut url = url::Url::parse(&format!("{}/api/accounts/authorize", self.origin))?;
+        let path = if self.legacy {
+            "/oauth/authorize"
+        } else {
+            "/api/accounts/authorize"
+        };
+        let mut url = url::Url::parse(&format!("{}{path}", self.origin))?;
         {
             let mut query = url.query_pairs_mut();
             query.extend_pairs([
@@ -209,24 +273,39 @@ impl Session {
                         &pending.client_id
                     },
                 ),
-                (
-                    "ext_agent_host_id",
-                    &format!("urn:uuid:{}", pending.device_id),
-                ),
                 ("response_type", "code"),
-                ("redirect_uri", REDIRECT),
-                ("resource", RESOURCE),
-                ("scope", SCOPE),
+                ("redirect_uri", self.redirect()),
+                (
+                    "scope",
+                    if self.legacy {
+                        "openid profile email offline_access"
+                    } else {
+                        SCOPE
+                    },
+                ),
                 ("state", &pending.state),
-                ("nonce", &pending.nonce),
                 (
                     "code_challenge",
                     &URL_SAFE_NO_PAD.encode(Sha256::digest(pending.verifier.as_bytes())),
                 ),
                 ("code_challenge_method", "S256"),
             ]);
-            if pending.client_id.is_empty() {
-                query.append_pair("agent_name_hint", "fumo-gateway");
+            if self.legacy {
+                query.extend_pairs([
+                    ("id_token_add_organizations", "true"),
+                    ("codex_cli_simplified_flow", "true"),
+                    ("originator", "fumo-gateway"),
+                ]);
+            } else {
+                query.append_pair(
+                    "ext_agent_host_id",
+                    &format!("urn:uuid:{}", pending.device_id),
+                );
+                query.append_pair("resource", RESOURCE);
+                query.append_pair("nonce", &pending.nonce);
+                if pending.client_id.is_empty() {
+                    query.append_pair("agent_name_hint", "fumo-gateway");
+                }
             }
         }
         state.pending = Some(pending);
@@ -241,25 +320,27 @@ impl Session {
             state.pending = None;
             return Err(AuthError::LoginExpired);
         }
-        let (code, client_id) = parse_callback(callback, pending)?;
+        let (code, client_id) = parse_callback(callback, pending, self.redirect())?;
         let verifier = pending.verifier.clone();
         let device_id = pending.device_id.clone();
         let expires = pending.expires;
         drop(state);
-        let form = [
+        let mut form = vec![
             ("grant_type", "authorization_code"),
             ("client_id", &client_id),
             ("code", &code),
             ("code_verifier", &verifier),
-            ("redirect_uri", REDIRECT),
-            ("resource", RESOURCE),
+            ("redirect_uri", self.redirect()),
         ];
+        if !self.legacy {
+            form.push(("resource", RESOURCE));
+        }
         let exchange = async {
             let (ok, body) = self.post_tokens(&form).await?;
             if !ok {
                 bail!("TokenExchangeFailed");
             }
-            parse_tokens(&body, &client_id, &device_id, None)
+            parse_tokens(&body, &client_id, &device_id, None, self.legacy)
         };
         let replacement = tokio::time::timeout_at(expires, exchange)
             .await
@@ -267,7 +348,8 @@ impl Session {
             .map_err(|_| AuthError::ExchangeFailed)?;
         let mut state = self.state.lock().await;
         // No await between persistence and publication: cancellation cannot split them.
-        save(&self.directory, &replacement).map_err(|_| AuthError::CredentialSaveFailed)?;
+        self.save(&replacement)
+            .map_err(|_| AuthError::CredentialSaveFailed)?;
         state.credentials = replacement;
         state.generation += 1;
         state.retry_at = None;
@@ -279,7 +361,7 @@ impl Session {
         let _login = self.login.lock().await;
         let mut state = self.state.lock().await;
         let retained = state.credentials.registration();
-        save(&self.directory, &retained)?;
+        self.save(&retained)?;
         state.credentials = retained;
         state.generation += 1;
         state.retry_at = None;
@@ -289,20 +371,22 @@ impl Session {
 
     async fn refresh(&self, snapshot: Credentials, generation: u64) {
         let exchange = async {
-            let (ok, body) = self
-                .post_tokens(&[
-                    ("grant_type", "refresh_token"),
-                    ("client_id", &snapshot.client_id),
-                    ("refresh_token", &snapshot.refresh_token),
-                    ("resource", RESOURCE),
-                ])
-                .await?;
+            let mut form = vec![
+                ("grant_type", "refresh_token"),
+                ("client_id", &snapshot.client_id),
+                ("refresh_token", &snapshot.refresh_token),
+            ];
+            if !self.legacy {
+                form.push(("resource", RESOURCE));
+            }
+            let (ok, body) = self.post_tokens(&form).await?;
             if ok {
                 return parse_tokens(
                     &body,
                     &snapshot.client_id,
                     &snapshot.device_id,
                     Some(&snapshot.id_token),
+                    self.legacy,
                 );
             }
             let failure: Value = serde_json::from_slice(&body)?;
@@ -332,7 +416,7 @@ impl Session {
             Err(_) => "timeout",
             Ok(Err(_)) => "exchange",
             Ok(Ok(replacement)) => {
-                if save(&self.directory, &replacement).is_ok() {
+                if self.save(&replacement).is_ok() {
                     state.credentials = replacement;
                     state.retry_at = None;
                     return;
@@ -348,7 +432,15 @@ impl Session {
     async fn post_tokens(&self, form: &[(&str, &str)]) -> Result<(bool, Vec<u8>)> {
         let response = self
             .client
-            .post(format!("{}/api/accounts/oauth/token", self.origin))
+            .post(format!(
+                "{}{}",
+                self.origin,
+                if self.legacy {
+                    "/oauth/token"
+                } else {
+                    "/api/accounts/oauth/token"
+                }
+            ))
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .form(form)
@@ -379,18 +471,22 @@ fn parse_tokens(
     client_id: &str,
     device_id: &str,
     previous_id: Option<&str>,
+    legacy: bool,
 ) -> Result<Credentials> {
     #[derive(Deserialize)]
     struct Tokens {
         access_token: String,
         refresh_token: String,
         id_token: Option<String>,
-        scope: String,
+        scope: Option<String>,
         expires_in: i64,
     }
     let tokens: Tokens = serde_json::from_slice(body)?;
     if tokens.expires_in <= 0 {
         bail!("InvalidTokenExpiry");
+    }
+    if legacy {
+        account_id(&tokens.access_token)?;
     }
     let obtained_at = now();
     let expires_at = obtained_at
@@ -399,13 +495,22 @@ fn parse_tokens(
     let id_token = tokens
         .id_token
         .filter(|id| !id.is_empty())
-        .or_else(|| previous_id.map(str::to_owned))
-        .ok_or_else(|| anyhow!("InvalidCredentials"))?;
+        .or_else(|| previous_id.map(str::to_owned));
+    let id_token = if legacy {
+        id_token.unwrap_or_default()
+    } else {
+        id_token.ok_or_else(|| anyhow!("InvalidCredentials"))?
+    };
+    let scope = if legacy {
+        tokens.scope.unwrap_or_default()
+    } else {
+        tokens.scope.ok_or_else(|| anyhow!("InvalidCredentials"))?
+    };
     Ok(Credentials {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         id_token,
-        scope: tokens.scope,
+        scope,
         client_id: client_id.into(),
         device_id: device_id.into(),
         expires_at,
@@ -417,10 +522,11 @@ fn parse_tokens(
 fn parse_callback(
     callback: &str,
     pending: &Pending,
+    redirect: &str,
 ) -> std::result::Result<(String, String), AuthError> {
     let invalid = AuthError::InvalidCallback;
     let query = callback
-        .strip_prefix(&format!("{REDIRECT}?"))
+        .strip_prefix(&format!("{redirect}?"))
         .ok_or(invalid)?;
     if query.contains('#') {
         return Err(invalid);
@@ -484,7 +590,20 @@ fn decode(input: &str) -> std::result::Result<String, AuthError> {
     String::from_utf8(output).map_err(|_| AuthError::InvalidCallback)
 }
 
-fn save(directory: &Path, credentials: &Credentials) -> Result<()> {
+fn account_id(token: &str) -> Result<String> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| anyhow!("InvalidCredentials"))?;
+    let payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    let id = payload["https://api.openai.com/auth"]["chatgpt_account_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("InvalidCredentials"))?;
+    Ok(id.to_owned())
+}
+
+fn save(directory: &Path, credentials: &Credentials, legacy: bool) -> Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -498,7 +617,14 @@ fn save(directory: &Path, credentials: &Credentials) -> Result<()> {
             .open(&temporary)?;
         file.write_all(&serde_json::to_vec(credentials)?)?;
         file.sync_all()?;
-        fs::rename(&temporary, directory.join("codex.json"))?;
+        fs::rename(
+            &temporary,
+            directory.join(if legacy {
+                "codex-legacy.json"
+            } else {
+                "codex.json"
+            }),
+        )?;
         Ok(())
     })();
     if result.is_err() {
@@ -587,6 +713,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_login_refresh_and_disconnect_are_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("credentials");
+        let siwc = Credentials {
+            access_token: "siwc".into(),
+            expires_at: now() + 3600,
+            ..Credentials::default()
+        };
+        save(&directory, &siwc, false).unwrap();
+        let jwt = |account: &str| {
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(
+                    json!({"https://api.openai.com/auth": {"chatgpt_account_id": account}})
+                        .to_string()
+                )
+            )
+        };
+        let first = jwt("account-one");
+        let second = jwt("account-two");
+        let body =
+            json!({"access_token": first, "refresh_token": "refresh-one", "expires_in": 3600})
+                .to_string();
+        let (origin, request) = fixture("200 OK", &body).await;
+        let mut legacy = Session::load_legacy(
+            directory.clone(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut legacy).unwrap().origin = origin;
+        assert!(legacy.is_legacy());
+        assert!(!session(&directory).is_legacy());
+        let start = legacy.start().await.unwrap();
+        let url = url::Url::parse(start["authorization_url"].as_str().unwrap()).unwrap();
+        assert_eq!(url.path(), "/oauth/authorize");
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], LEGACY_CLIENT_ID);
+        assert_eq!(query["redirect_uri"], LEGACY_REDIRECT);
+        assert_eq!(query["scope"], "openid profile email offline_access");
+        assert_eq!(query["response_type"], "code");
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert_eq!(query["id_token_add_organizations"], "true");
+        assert_eq!(query["codex_cli_simplified_flow"], "true");
+        assert_eq!(query["originator"], "fumo-gateway");
+        for name in ["resource", "nonce", "ext_agent_host_id", "agent_name_hint"] {
+            assert!(!query.contains_key(name));
+        }
+        let state = legacy.state.lock().await;
+        let pending = state.pending.as_ref().unwrap();
+        let verifier = pending.verifier.clone();
+        assert_eq!(
+            query["code_challenge"],
+            URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+        );
+        let callback = format!("{LEGACY_REDIRECT}?state={}&code=code", pending.state);
+        drop(state);
+        assert_eq!(
+            legacy
+                .complete(&callback.replace(LEGACY_REDIRECT, REDIRECT))
+                .await,
+            Err(AuthError::InvalidCallback)
+        );
+        legacy.complete(&callback).await.unwrap();
+        let request = request.await.unwrap();
+        assert!(request.starts_with("POST /oauth/token HTTP/1.1\r\n"));
+        let form: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(request.split_once("\r\n\r\n").unwrap().1.as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(form["grant_type"], "authorization_code");
+        assert_eq!(form["client_id"], LEGACY_CLIENT_ID);
+        assert_eq!(form["code_verifier"], verifier);
+        assert_eq!(form["redirect_uri"], LEGACY_REDIRECT);
+        assert!(!form.contains_key("resource"));
+        let headers = legacy.headers().await.unwrap();
+        assert_eq!(headers["authorization"], format!("Bearer {first}"));
+        assert_eq!(headers["user-agent"], "fumo-gateway");
+        assert_eq!(headers["chatgpt-account-id"], "account-one");
+        assert_eq!(headers["originator"], "fumo-gateway");
+        assert_eq!(headers["openai-beta"], "responses=experimental");
+        let body =
+            json!({"access_token": second, "refresh_token": "refresh-two", "expires_in": 3600})
+                .to_string();
+        let (origin, request) = fixture("200 OK", &body).await;
+        Arc::get_mut(&mut legacy).unwrap().origin = origin;
+        {
+            let mut state = legacy.state.lock().await;
+            state.credentials.expires_at = now() - 1;
+        }
+        assert_eq!(
+            legacy.headers().await.unwrap()["chatgpt-account-id"],
+            "account-two"
+        );
+        let request = request.await.unwrap();
+        assert!(request.starts_with("POST /oauth/token HTTP/1.1\r\n"));
+        let form: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(request.split_once("\r\n\r\n").unwrap().1.as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(form["grant_type"], "refresh_token");
+        assert_eq!(form["client_id"], LEGACY_CLIENT_ID);
+        assert_eq!(form["refresh_token"], "refresh-one");
+        assert!(!form.contains_key("resource"));
+        let loaded = Session::load_legacy(directory.clone(), legacy.client.clone()).unwrap();
+        assert_eq!(
+            loaded.headers().await.unwrap()["chatgpt-account-id"],
+            "account-two"
+        );
+        assert_eq!(
+            loaded.state.lock().await.credentials.refresh_token,
+            "refresh-two"
+        );
+        loaded.disconnect().await.unwrap();
+        assert!(loaded.authorization().await.is_err());
+        assert_eq!(
+            session(&directory).authorization().await.unwrap(),
+            "Bearer siwc"
+        );
+        assert!(
+            parse_tokens(
+                json!({"access_token": jwt(""), "refresh_token": "refresh", "expires_in": 3600})
+                    .to_string()
+                    .as_bytes(),
+                LEGACY_CLIENT_ID,
+                "",
+                None,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn login_exchanges_pkce_and_persists_registration() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("credentials");
@@ -650,7 +909,7 @@ mod tests {
                 expires_at: now() + 60,
                 ..Credentials::default()
             };
-            save(&directory, &current).unwrap();
+            save(&directory, &current, false).unwrap();
             let (origin, request) = fixture(status, body).await;
             let mut session = session(&directory);
             Arc::get_mut(&mut session).unwrap().origin = origin;
@@ -682,6 +941,7 @@ mod tests {
                 expires_at: now() - 1,
                 ..Credentials::default()
             },
+            false,
         )
         .unwrap();
         let (origin, request) = fixture("200 OK", TOKENS).await;
@@ -704,6 +964,7 @@ mod tests {
                 expires_at: now() - 1,
                 ..Credentials::default()
             },
+            false,
         )
         .unwrap();
         let (origin, request) =
@@ -729,7 +990,7 @@ mod tests {
             expires_at: now() + 10,
             ..Credentials::default()
         };
-        save(&directory, &current).unwrap();
+        save(&directory, &current, false).unwrap();
         let (origin, request) = fixture("200 OK", TOKENS).await;
         let mut session = session(&directory);
         Arc::get_mut(&mut session).unwrap().origin = origin;

@@ -39,6 +39,7 @@ pub enum Auth {
     None,
     ApiKey(String),
     Codex(PathBuf),
+    CodexLegacy(PathBuf),
 }
 
 impl std::fmt::Debug for Auth {
@@ -47,6 +48,7 @@ impl std::fmt::Debug for Auth {
             Self::None => f.write_str("None"),
             Self::ApiKey(_) => f.write_str("ApiKey([redacted])"),
             Self::Codex(path) => f.debug_tuple("Codex").field(path).finish(),
+            Self::CodexLegacy(path) => f.debug_tuple("CodexLegacy").field(path).finish(),
         }
     }
 }
@@ -107,6 +109,7 @@ struct AuthOptions {
 #[serde(rename_all = "snake_case")]
 enum AuthProvider {
     Codex,
+    CodexLegacy,
     ApiKey,
 }
 
@@ -176,7 +179,7 @@ impl Config {
             let auth = match options.auth {
                 None => Auth::None,
                 Some(auth) => match auth.provider {
-                    AuthProvider::Codex => {
+                    AuthProvider::Codex | AuthProvider::CodexLegacy => {
                         ensure!(auth.key_env.is_none(), "invalid upstream auth");
                         let directory = match auth.credentials_dir {
                             Some(path) => {
@@ -188,11 +191,19 @@ impl Config {
                             }
                             None => default_directory(env)?,
                         };
-                        ensure!(
-                            base_url == "https://api.openai.com/v1",
-                            "invalid Codex endpoint"
-                        );
-                        Auth::Codex(directory)
+                        if matches!(auth.provider, AuthProvider::CodexLegacy) {
+                            ensure!(
+                                base_url == "https://chatgpt.com/backend-api/codex",
+                                "invalid Codex endpoint"
+                            );
+                            Auth::CodexLegacy(directory)
+                        } else {
+                            ensure!(
+                                base_url == "https://api.openai.com/v1",
+                                "invalid Codex endpoint"
+                            );
+                            Auth::Codex(directory)
+                        }
                     }
                     AuthProvider::ApiKey => {
                         ensure!(auth.credentials_dir.is_none(), "invalid upstream auth");
@@ -251,7 +262,7 @@ impl Config {
         let admin_directory = if admin.is_some()
             && !upstreams
                 .iter()
-                .any(|upstream| matches!(upstream.auth, Auth::Codex(_)))
+                .any(|upstream| matches!(upstream.auth, Auth::Codex(_) | Auth::CodexLegacy(_)))
         {
             Some(default_directory(env)?)
         } else {
@@ -435,6 +446,36 @@ mod tests {
         assert!(
             matches!(&config.upstreams[0].auth, Auth::Codex(path) if path == Path::new("/credentials"))
         );
+    }
+
+    #[test]
+    fn legacy_codex_requires_its_own_endpoint() {
+        for (provider, endpoint) in [
+            ("codex", "https://api.openai.com/v1"),
+            ("codex_legacy", "https://chatgpt.com/backend-api/codex"),
+        ] {
+            for base_url in [
+                "https://api.openai.com/v1",
+                "https://chatgpt.com/backend-api/codex",
+                "https://example.com",
+            ] {
+                let text = serde_json::json!({"admin":{}, "upstreams":{"personal":{
+                    "base_url":base_url, "auth":{"provider":provider,"credentials_dir":"/credentials"}
+                }}});
+                let result = Config::parse(text.to_string().as_bytes(), &|name| {
+                    assert_eq!(name, "FUMO_ADMIN_KEY");
+                    Some("admin-key".into())
+                });
+                assert_eq!(result.is_ok(), base_url == endpoint);
+                if let Ok(config) = result {
+                    assert!(config.admin_directory.is_none());
+                    assert_eq!(
+                        matches!(config.upstreams[0].auth, Auth::CodexLegacy(_)),
+                        provider == "codex_legacy"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -247,7 +247,12 @@ async fn handle(
         let mut accounts = Vec::with_capacity(admin.accounts.len());
         for account in &admin.accounts {
             let state = account.session.status().await;
-            accounts.push(json!({"id": account.id, "provider": "codex", "status": state.status, "configured": account.configured, "pending": state.pending}));
+            let provider = if account.session.is_legacy() {
+                "codex_legacy"
+            } else {
+                "codex"
+            };
+            accounts.push(json!({"id": account.id, "provider": provider, "status": state.status, "configured": account.configured, "pending": state.pending}));
         }
         return json_response(StatusCode::OK, json!({"accounts": accounts}));
     }
