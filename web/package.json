@@ -14,18 +14,18 @@
         "test:schema": "bun test tests/config-schema.test.ts"
     },
     "dependencies": {
-        "solid-js": "2.0.0-rc.20",
-        "@solidjs/web": "2.0.0-rc.20"
+        "solid-js": "2.0.0-rc.21",
+        "@solidjs/web": "2.0.0-rc.21"
     },
     "devDependencies": {
-        "@solidjs/vite-plugin": "3.0.0-next.53",
-        "@solidjs/compiler": "2.0.0-rc.20",
-        "@solidjs/babel-plugin": "2.0.0-rc.20",
-        "@types/node": "^24.19.2",
+        "@solidjs/vite-plugin": "3.0.0-next.57",
+        "@solidjs/compiler": "2.0.0-rc.21",
+        "@solidjs/babel-plugin": "2.0.0-rc.21",
+        "@types/node": "^26.6.6",
         "@types/bun": "latest",
         "ajv": "^8.17.1",
         "typescript": "~7.0.2",
-        "vite": "^8.3.5",
+        "vite": "^8.3.6",
         "oxlint": "latest",
         "playwright": "latest"
     }
