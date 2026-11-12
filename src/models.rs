@@ -92,7 +92,8 @@ async fn discover(
         if let ProviderAuth::Codex(session) = &upstream.auth
             && session.is_legacy()
         {
-            request = request.query(&[("client_version", env!("CARGO_PKG_VERSION"))]);
+            // Codex selects its catalog by Codex CLI version, not Fumo's version.
+            request = request.query(&[("client_version", "0.167.0")]);
         }
         let response = request.send().await?;
         ensure!(
@@ -235,7 +236,7 @@ mod tests {
                 }
                 let request = String::from_utf8(request).unwrap().to_lowercase();
                 let path = if legacy {
-                    concat!("/models?client_version=", env!("CARGO_PKG_VERSION"))
+                    "/models?client_version=0.167.0"
                 } else {
                     "/models"
                 };
