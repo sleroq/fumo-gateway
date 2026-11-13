@@ -163,19 +163,19 @@ async fn responses_and_chat_preserve_payload_status_and_end_to_end_headers() {
             let lower = head.to_lowercase();
             assert!(lower.contains("authorization: bearer upstream-secret\r\n"));
             assert!(lower.contains("openai-beta: responses=experimental\r\n"));
-            assert!(lower.contains("x-request-id: forward-me\r\n"));
             assert!(lower.contains("session-id: stable-session\r\n"));
+            assert!(lower.contains("x-session-affinity: stable-session\r\n"));
             assert!(lower.contains("x-client-request-id: stable-session\r\n"));
-            assert!(lower.contains("x-provider-future: first\r\n"));
-            assert!(lower.contains("x-provider-future: second\r\n"));
-            assert!(lower.contains("cookie: upstream-cookie=value\r\n"));
-            assert!(lower.contains("x-api-key: upstream-api-key\r\n"));
             assert!(lower.contains("content-type: application/json\r\n"));
             assert!(lower.contains("accept-encoding: identity\r\n"));
             for secret in [
                 "client-secret",
                 "private",
                 "proxy-authorization:",
+                "x-request-id:",
+                "x-provider-future:",
+                "cookie:",
+                "x-api-key:",
                 "x-hop-secret:",
                 "fumo.example.invalid",
                 "charset=utf-8",
@@ -226,6 +226,7 @@ async fn responses_and_chat_preserve_payload_status_and_end_to_end_headers() {
             .header("openai-beta", "responses=experimental")
             .header("x-request-id", "forward-me")
             .header("session-id", "stable-session")
+            .header("x-session-affinity", "stable-session")
             .header("x-client-request-id", "stable-session")
             .send()
             .await

@@ -2,11 +2,11 @@ import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getSupportedThinkingLevels, InMemoryModelsStore, Type, type Context } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, InMemoryModelsStore, normalizeContext, Type, type Context, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { generateSummary, ModelRuntime, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { parseCatalog } from "../catalog";
 import gatewayCatalog from "../../tests/fixtures/model-catalog.json";
-import { createFumoProvider } from "./index";
+import { createFumoProvider, toPiModel } from "./index";
 
 const entries = await parseCatalog(Response.json(gatewayCatalog));
 const directories: string[] = [];
@@ -109,7 +109,7 @@ const context: Context = {
   ],
 };
 
-async function nativeRequest(runtime: ModelRuntime, id: string, cacheRetention: "long" | "none" = "long") {
+async function nativeRequest(runtime: ModelRuntime, id: string, cacheRetention: "long" | "none" = "long", requestContext = context, onPayload?: SimpleStreamOptions["onPayload"], extraOptions: SimpleStreamOptions = {}) {
   const requests: Request[] = [];
   spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
     const request = new Request(input, init);
@@ -129,8 +129,8 @@ async function nativeRequest(runtime: ModelRuntime, id: string, cacheRetention: 
       headers: { "Content-Type": "text/event-stream" },
     });
   }, { preconnect() {} }));
-  const result = await runtime.completeSimple(runtime.getModel("fumo", id)!, context, {
-    maxTokens: 100, reasoning: "high", cacheRetention, sessionId: "fixture-session",
+  const result = await runtime.completeSimple(runtime.getModel("fumo", id)!, requestContext, {
+    maxTokens: 100, reasoning: "high", cacheRetention, sessionId: "fixture-session", onPayload, ...extraOptions,
   });
   expect(result.errorMessage).toBeUndefined();
   expect(requests).toHaveLength(1);
@@ -144,8 +144,14 @@ test("constrained native Responses keeps full IDs, tools, and top-level effort",
   const { runtime } = await discover("https://gateway.example.test/v1");
   const { request, payload } = await nativeRequest(runtime, "personal/gpt-6.1-sol");
   expect(request.url).toBe("https://gateway.example.test/v1/responses");
+  expect(request.headers.get("accept")).toBe("application/json");
+  expect(request.headers.get("originator")).toBeNull();
   expect(payload).toMatchObject({ stream: true, store: false, prompt_cache_key: "fixture-session" });
-  expect(payload.input).toBeArray();
+  expect(payload.input).toContainEqual(expect.objectContaining({ role: "developer", content: "Fixture instructions" }));
+  expect(payload.instructions).toBeUndefined();
+  expect(payload.text).toBeUndefined();
+  expect(payload.tool_choice).toBeUndefined();
+  expect(payload.parallel_tool_calls).toBeUndefined();
   for (const field of entries[0].request_constraints!.responses.omit) expect(payload).not.toHaveProperty(field);
   expect(payload.tools).toBeUndefined();
   expect(payload.input).toContainEqual(expect.objectContaining({
@@ -180,12 +186,141 @@ test("legacy Responses metadata drives native flat tools and instructions", asyn
   const model = runtime.getModel("fumo", legacy.id)!;
   expect(model.samplingParams).toEqual({ instructions: "You are a helpful assistant." });
   expect(model.compat).toMatchObject({ supportsAdditionalTools: false, supportsMidConvoSystemMessages: false, supportsMidConvoEffort: false });
-  const { payload } = await nativeRequest(runtime, legacy.id);
-  expect(payload.instructions).toBe("You are a helpful assistant.");
-  expect(payload.tools).toContainEqual(expect.objectContaining({ name: "fixture_read", type: "function" }));
-  expect(payload.input).toContainEqual(expect.objectContaining({ role: "developer" }));
+
+  const { request, payload } = await nativeRequest(runtime, legacy.id);
+  expect(request.headers.get("accept")).toBe("text/event-stream");
+  expect(request.headers.get("originator")).toBe("pi");
+  expect(payload.instructions).toBe("Fixture instructions");
+  expect(payload.text).toEqual({ verbosity: "low" });
+  expect(payload.tool_choice).toBe("auto");
+  expect(payload.parallel_tool_calls).toBe(true);
+  expect(payload.tools[0].strict).toBeNull();
+  expect(payload.tools).toContainEqual(expect.objectContaining({ name: "fixture_read", type: "function", parameters: expect.objectContaining({ properties: { path: { type: "string" } } }) }));
+  expect(payload.input).toEqual([expect.objectContaining({ role: "user" })]);
+  expect(payload.prompt_cache_key).toBe("fixture-session");
+
+  const absent = (await nativeRequest(runtime, legacy.id, "long", { messages: [{ role: "user", content: "Hello", timestamp: 1 }] })).payload;
+  expect(absent.instructions).toBe("You are a helpful assistant.");
+  expect(absent.text).toEqual({ verbosity: "low" });
+  expect(absent.tool_choice).toBe("auto");
+  expect(absent.parallel_tool_calls).toBe(true);
+  expect(absent.tools).toBeUndefined();
+  expect(absent.input).toEqual([expect.objectContaining({ role: "user" })]);
+
+  let observed: unknown;
+  const hooked = (await nativeRequest(runtime, legacy.id, "long", context, (value) => {
+    observed = value;
+    if (!value || typeof value !== "object") throw new Error("Expected request object");
+    return { ...value, metadata: { source: "hook" } };
+  })).payload;
+  expect(observed).toMatchObject({ instructions: "Fixture instructions" });
+  expect(hooked.metadata).toEqual({ source: "hook" });
+  const explicit = (await nativeRequest(runtime, legacy.id, "long", context, (value) => {
+    expect(value).toMatchObject({ instructions: "Explicit", text: { verbosity: "high" }, tool_choice: "none", parallel_tool_calls: false, tools: [{ strict: false }] });
+    if (!value || typeof value !== "object") throw new Error("Expected request object");
+    return { ...value, tool_choice: "required", parallel_tool_calls: true };
+  }, { samplingParams: { instructions: "Explicit", text: { verbosity: "high" }, tool_choice: "none", parallel_tool_calls: false, tools: [{ type: "function", name: "explicit", parameters: {}, strict: false }] } })).payload;
+  expect(explicit).toMatchObject({ tool_choice: "required", parallel_tool_calls: true, tools: [{ strict: false }] });
+
+  const strictContext: Context = { messages: [
+    { role: "system", content: "Strict", timestamp: 0, toolsAdded: [{ name: "strict_tool", description: "Strict tool", parameters: Type.Object({ value: Type.String() }), constrainedSampling: { type: "json_schema", strict: "require" } }] },
+    { role: "user", content: "Hello", timestamp: 1 },
+  ] };
+  expect((await nativeRequest(runtime, legacy.id, "long", strictContext)).payload.tools[0].strict).toBe(true);
+
+  const withSections = (await nativeRequest(runtime, legacy.id, "long", { messages: [
+    { role: "system", content: "Base", sections: { policy: "Policy text" }, timestamp: 0, toolsAdded: context.messages[0].role === "system" ? context.messages[0].toolsAdded : [] },
+    { role: "user", content: "First", timestamp: 1 },
+    { role: "user", content: "Second", timestamp: 2 },
+  ] }, () => undefined)).payload;
+  expect(withSections.instructions).toBe("Base\n\nPolicy text");
+  expect(withSections.tools).toContainEqual(expect.objectContaining({ name: "fixture_read" }));
+  expect(withSections.input).toHaveLength(2);
   expect(payload.input.some((item: { type?: string }) => item.type === "additional_tools" || item.type === "configuration_update")).toBe(false);
   for (const field of legacy.request_constraints.responses.omit) expect(payload).not.toHaveProperty(field);
+});
+
+test("legacy Responses adapts streamed Codex terminal events for both Pi adapters", async () => {
+  const legacy = {
+    ...gatewayCatalog.data[0], id: "legacy/example",
+    request_constraints: { responses: {
+      ...entries[0].request_constraints!.responses, function_tools: "flat" as const, instructions: "Default instructions",
+    } },
+  };
+
+  const [entry] = await parseCatalog(Response.json({ data: [legacy] }));
+  const model = toPiModel(entry, "https://gateway.example.test/v1");
+  const other = toPiModel(entries[0], "https://gateway.example.test/v1");
+  const provider = createFumoProvider();
+  const withoutSystem = normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] });
+  let calls = 0;
+  let payload: unknown;
+  function fixture(type: string) {
+    const bytes = new TextEncoder().encode(`: comment\r\nevent: response.output_item.done\r\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"héllo"}]}}\r\n\r\nevent: ${type}\r\ndata: {"type":"${type}",\r\ndata: "response":{"id":"fixture","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`);
+    return new Response(new ReadableStream({
+      start(controller) {
+        for (let i = 0; i < bytes.length; i += 3) controller.enqueue(bytes.slice(i, i + 3));
+        controller.close();
+      },
+    }), { headers: { "Content-Type": "text/event-stream; charset=utf-8" } });
+  }
+  let type = "response.done";
+  const fetch = Object.assign(async () => { calls++; return fixture(type); }, { preconnect() {} });
+  for (const method of ["stream", "streamSimple"] as const) {
+    const result = await provider[method](model, withoutSystem, {
+      apiKey: "fixture", fetch, onPayload(value) { payload = value; },
+    }).result();
+    expect(result.errorMessage).toBeUndefined();
+    expect(result.stopReason).toBe("stop");
+    expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "héllo" }));
+    expect(result.usage).toMatchObject({ input: 3, output: 2, totalTokens: 5 });
+    expect(payload).toMatchObject({ instructions: "Default instructions" });
+  }
+  type = "response.completed";
+  expect((await provider.streamSimple(model, withoutSystem, { apiKey: "fixture", fetch }).result()).stopReason).toBe("stop");
+  type = "response.done";
+  expect((await provider.streamSimple(other, withoutSystem, { apiKey: "fixture", fetch }).result()).stopReason).toBe("error");
+  expect(calls).toBe(4);
+});
+
+test("legacy terminal events finish without waiting for upstream EOF", async () => {
+  const legacy = {
+    ...gatewayCatalog.data[0], id: "legacy/example",
+    request_constraints: { responses: {
+      ...entries[0].request_constraints!.responses, function_tools: "flat" as const, instructions: "Default instructions",
+    } },
+  };
+  const [entry] = await parseCatalog(Response.json({ data: [legacy] }));
+  const model = toPiModel(entry, "https://gateway.example.test/v1");
+  const provider = createFumoProvider();
+  const context = normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] });
+
+  for (const type of ["response.done", "response.completed", "response.incomplete"]) {
+    let canceled = false;
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify({
+          type, response: { id: "fixture", status: "completed", end_turn: true, output: [], usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 } },
+        })}\n\n`));
+      },
+      cancel() { canceled = true; },
+    });
+    const fetch = Object.assign(async () => new Response(source, { headers: { "Content-Type": "text/event-stream", "Content-Length": "123", "X-Fixture": "preserved" } }), { preconnect() {} });
+    const events: unknown[] = [];
+    let headers: Record<string, string> | undefined;
+    const result = await Promise.race([
+      provider.streamSimple(model, context, { apiKey: "fixture", fetch, onResponse: (response) => { headers = response.headers; }, onProviderStreamEvent: (event) => { events.push(event); } }).result(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Timed out after ${type}`)), 1000)),
+    ]);
+    expect(result.stopReason).toBe("stop");
+    expect(events).toContainEqual(expect.objectContaining({ type: type === "response.done" ? "response.completed" : type, response: expect.objectContaining({ end_turn: true }) }));
+    expect(result.endTurn).toBeUndefined();
+    expect(headers).not.toHaveProperty("content-length");
+    expect(headers?.["x-fixture"]).toBe("preserved");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(canceled).toBe(true);
+    expect(source.locked).toBe(false);
+  }
 });
 
 test("compaction summarizes with the Sign in with ChatGPT model without unsupported cache options", async () => {

@@ -4,8 +4,7 @@ pub(crate) fn client(proxy: Option<&str>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .http1_only();
+        .retry(reqwest::retry::never());
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?);
     }
