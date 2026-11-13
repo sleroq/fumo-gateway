@@ -6,19 +6,19 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 http-body-util = "0.1"
 indexmap = "2"
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "stream", "socks", "rustls-tls-native-roots"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "form", "query", "stream", "socks", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 tokio = { version = "1", features = ["rt", "macros", "net", "sync", "time", "io-util"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-zstd = "0.13"
+zstd = "0.14"
 
 [dev-dependencies]
 tempfile = "3"

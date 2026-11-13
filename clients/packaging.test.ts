@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import { $ } from "bun";
-import ts from "typescript";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,8 +48,8 @@ test("standalone npm tarballs include shared discovery, declarations and native 
       const localDirectory = process.cwd() + "/node_modules/@fumo-gateway/opencode";
       await Bun.write(localDirectory + "/server.ts", 'export default { id: "obsolete" };');
       const probe = 'import { Host } from "@opencode/plugin/host"; console.log(Host.resolve({ directory: process.cwd() + "/node_modules/@fumo-gateway/opencode" }).server)';
-      assert.ok(Bun.spawnSync([process.execPath, "-e", probe]).stdout.toString().trim().endsWith("/server.ts"));
-      // Home Manager removes precisely this obsolete managed entrypoint.
+      assert.equal(Bun.spawnSync([process.execPath, "-e", probe]).stdout.toString().trim(), parts.server);
+      // An obsolete managed entrypoint must not override package exports.
       await (await import("node:fs/promises")).rm(localDirectory + "/server.ts");
       assert.equal(Bun.spawnSync([process.execPath, "-e", probe]).stdout.toString().trim(), parts.server);
       assert.equal(opencode.id, "fumo");
@@ -72,12 +71,14 @@ test("standalone npm tarballs include shared discovery, declarations and native 
 
     const consumer = join(directory, "consumer.mts");
     await Bun.write(consumer, 'import { createFumoProvider } from "@fumo-gateway/pi"; import { createFumoPlugin } from "@fumo-gateway/opencode"; createFumoProvider({ baseUrl: "https://example.test/v1" }); createFumoPlugin({ baseURL: "https://example.test/v1" });');
-    const program = ts.createProgram([consumer], { noEmit: true, module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext });
-    const owned = [consumer, join(directory, "node_modules/@fumo-gateway/pi/"), join(directory, "node_modules/@fumo-gateway/opencode/")];
     // Some host SDK declarations are Bundler-only. Verify our declarations and
     // consumer without treating unrelated upstream SDK diagnostics as Fumo's.
-    const diagnostics = ts.getPreEmitDiagnostics(program).filter(({ file }) => file && owned.some((path) => file.fileName.startsWith(path)));
-    expect(diagnostics.map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))).toEqual([]);
+    const result = Bun.spawnSync([process.execPath, join(import.meta.dir, "node_modules/typescript/bin/tsc"), "--ignoreConfig", "--noEmit", "--module", "NodeNext", "--moduleResolution", "NodeNext", "--pretty", "false", consumer], { cwd: directory });
+    const output = result.stdout.toString();
+    expect(result.stderr.toString()).toBe("");
+    if (result.exitCode !== 0) expect(output).toContain("error TS");
+    const diagnostics = output.split("\n").filter((line) => /^(error TS|consumer\.mts|node_modules\/@fumo-gateway\/(pi|opencode)\/)/.test(line));
+    expect(diagnostics).toEqual([]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

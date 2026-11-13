@@ -26,9 +26,9 @@
     "prepack": "bun run build"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": "^1.5.2",
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "typebox": "^1.4.7"
   },
   "publishConfig": {
     "access": "public"

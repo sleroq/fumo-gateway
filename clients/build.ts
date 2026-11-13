@@ -18,7 +18,7 @@ export async function buildClient(client: "pi" | "opencode") {
   // relative modules but leaves host-provided packages external.
   const types = Bun.spawn([
     process.execPath, join(import.meta.dir, "node_modules/typescript/bin/tsc"), entry,
-    "--declaration", "--emitDeclarationOnly", "--outDir", join(directory, "dist"),
+    "--ignoreConfig", "--declaration", "--emitDeclarationOnly", "--outDir", join(directory, "dist"),
     "--rootDir", import.meta.dir, "--module", "ESNext", "--moduleResolution", "Bundler",
     "--target", "ES2022", "--strict", "--skipLibCheck", "--types", "bun",
   ], { cwd: import.meta.dir, stdout: "inherit", stderr: "inherit" });

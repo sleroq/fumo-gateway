@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use rand::RngCore;
+use rand::TryRng;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -149,7 +149,11 @@ fn session_response(token: &str, secure: bool, clear: bool) -> Response {
 }
 
 fn asset(headers: &HeaderMap, bytes: &'static [u8], content_type: &'static str) -> Response {
-    let etag = format!("\"{:x}\"", Sha256::digest(bytes));
+    let digest = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let etag = format!("\"{digest}\"");
     let unchanged = headers
         .get_all("if-none-match")
         .iter()
@@ -221,7 +225,9 @@ async fn handle(State(admin): State<Arc<Admin>>, request: Request) -> Response {
     let secure = header(headers, "origin").is_some_and(|origin| origin.starts_with("https://"));
     if session_route && method == Method::POST && bearer {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("system random number generator failed");
         let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         admin.sessions.lock().unwrap().insert(token.clone(), secure);
         return session_response(&token, secure, false);

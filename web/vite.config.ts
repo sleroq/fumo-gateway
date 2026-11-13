@@ -14,7 +14,7 @@ export default defineConfig({
         },
     },
     build: {
-        rollupOptions: {
+        rolldownOptions: {
             output: {
                 entryFileNames: "assets/admin.js",
                 chunkFileNames: "assets/[name].js",

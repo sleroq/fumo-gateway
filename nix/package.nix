@@ -1,8 +1,11 @@
 {
   lib,
+  aws-lc,
   stdenvNoCC,
   bun,
+  pkg-config,
   rustPlatform,
+  zstd,
 }:
 let
   webDependencies = stdenvNoCC.mkDerivation {
@@ -27,7 +30,7 @@ let
     '';
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
-    outputHash = "sha256-WYiZ881jIVSlXgjUmboMcchfSVbmrvxiyoqSdmgLgBY=";
+    outputHash = "sha256-3ubCt56pD0lX+q6DbKvRkc2Nh4fK/qqcZnSOaYnbVy4=";
   };
 in
 rustPlatform.buildRustPackage {
@@ -53,7 +56,14 @@ rustPlatform.buildRustPackage {
     ];
   };
   cargoLock.lockFile = ../Cargo.lock;
-  nativeBuildInputs = [ bun ];
+  nativeBuildInputs = [
+    bun
+    pkg-config
+  ];
+  buildInputs = [
+    aws-lc
+    zstd
+  ];
   preBuild = ''
     cp -R ${webDependencies} web/node_modules
     chmod -R u+w web/node_modules

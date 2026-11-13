@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -462,7 +462,9 @@ fn now() -> i64 {
 
 fn random_token() -> String {
     let mut bytes = [0; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system random number generator failed");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
