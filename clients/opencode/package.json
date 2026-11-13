@@ -1,6 +1,6 @@
 {
   "name": "@fumo-gateway/opencode",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Fumo gateway discovery and native HTTP adapters for OpenCode V2",
   "type": "module",
   "files": [
