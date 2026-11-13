@@ -231,19 +231,23 @@ async fn forward(gateway: &Gateway, request: Request<Body>, path: &str) -> Respo
             );
         }
     };
-    let mut outgoing = gateway
+    let mut client_headers = HeaderMap::new();
+    for (name, value) in &parts.headers {
+        if allowed_request_header(name) && !hop_by_hop(name, &parts.headers) {
+            client_headers.append(name, value.clone());
+        }
+    }
+    let upstream = match gateway
         .http
         .post(format!("{}{path}", provider.config.base_url))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT_ENCODING, "identity")
-        .body(body);
-    for (name, value) in &parts.headers {
-        if !blocked_request_header(name, &parts.headers) {
-            outgoing = outgoing.header(name, value);
-        }
-    }
-    outgoing = outgoing.headers(auth_headers);
-    let upstream = match outgoing.send().await {
+        .headers(auth_headers)
+        .headers(client_headers)
+        .body(body)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "bad_gateway"),
     };
@@ -310,17 +314,29 @@ pub(crate) fn body_error(err: axum::Error) -> Response {
     }
 }
 
-fn blocked_request_header(name: &HeaderName, headers: &HeaderMap) -> bool {
-    hop_by_hop(name, headers)
-        || matches!(
-            name.as_str(),
-            "authorization"
-                | "host"
-                | "content-length"
-                | "content-type"
-                | "accept-encoding"
-                | "expect"
-        )
+fn allowed_request_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "session-id"
+            | "session_id"
+            | "x-session-id"
+            | "x-client-request-id"
+            | "x-session-affinity"
+            | "openai-beta"
+            | "openai-organization"
+            | "openai-project"
+            | "originator"
+            | "user-agent"
+            | "x-stainless-lang"
+            | "x-stainless-package-version"
+            | "x-stainless-os"
+            | "x-stainless-arch"
+            | "x-stainless-runtime"
+            | "x-stainless-runtime-version"
+            | "x-stainless-retry-count"
+            | "x-stainless-timeout"
+    )
 }
 
 fn hop_by_hop(name: &HeaderName, headers: &HeaderMap) -> bool {
@@ -364,6 +380,19 @@ fn error(status: StatusCode, message: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_affinity_is_allowed_unless_connection_nominates_it() {
+        let name = HeaderName::from_static("x-session-affinity");
+        let mut headers = HeaderMap::new();
+        assert!(allowed_request_header(&name));
+        assert!(!hop_by_hop(&name, &headers));
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("X-Session-Affinity"),
+        );
+        assert!(hop_by_hop(&name, &headers));
+    }
 
     #[tokio::test]
     async fn legacy_inference_uses_its_session_and_replaces_caller_account_headers() {
@@ -416,6 +445,10 @@ mod tests {
         assert!(!Arc::ptr_eq(siwc, legacy));
         assert_eq!(siwc.status().await.status, "login_required");
         assert_eq!(legacy.status().await.status, "connected");
+        let defaults = gateway.providers[1].headers().await.unwrap();
+        assert_eq!(defaults["originator"], "fumo-gateway");
+        assert_eq!(defaults["user-agent"], "fumo-gateway");
+        assert_eq!(defaults["openai-beta"], "responses=experimental");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!(
@@ -435,8 +468,40 @@ mod tests {
             assert!(head.starts_with("POST /backend-api/codex/responses HTTP/1.1\r\n"));
             assert!(head.contains(&format!("authorization: Bearer {token}\r\n")));
             assert!(head.contains("chatgpt-account-id: test-account\r\n"));
-            assert!(head.contains("originator: fumo-gateway\r\n"));
-            assert!(head.contains("openai-beta: responses=experimental\r\n"));
+            for (name, value) in [
+                ("accept", "text/event-stream"),
+                ("session-id", "session"),
+                ("session_id", "session"),
+                ("x-session-id", "session"),
+                ("x-client-request-id", "request"),
+                ("openai-beta", "client-feature"),
+                ("openai-organization", "org"),
+                ("openai-project", "project"),
+                ("originator", "pi-client"),
+                ("user-agent", "pi-agent"),
+                ("x-stainless-lang", "js"),
+                ("x-stainless-package-version", "1"),
+                ("x-stainless-os", "os"),
+                ("x-stainless-arch", "arch"),
+                ("x-stainless-runtime", "node"),
+                ("x-stainless-runtime-version", "1"),
+                ("x-stainless-retry-count", "0"),
+                ("x-stainless-timeout", "60"),
+                ("content-type", "application/json"),
+                ("accept-encoding", "identity"),
+            ] {
+                assert!(head.contains(&format!("{name}: {value}\r\n")), "{head}");
+            }
+            for name in [
+                "x-session-affinity",
+                "x-forwarded-for",
+                "forwarded",
+                "x-custom",
+                "x-stainless-custom",
+                "content-encoding",
+            ] {
+                assert!(!head.contains(&format!("{name}:")), "{head}");
+            }
             assert!(!head.contains("spoofed"));
             let length: usize = head
                 .lines()
@@ -459,8 +524,33 @@ mod tests {
         let request = Request::builder().method(Method::POST)
             .header("authorization", "Bearer spoofed")
             .header("chatgpt-account-id", "spoofed")
-            .header("originator", "spoofed")
-            .header("openai-beta", "spoofed")
+            .header("accept", "text/event-stream")
+            .header("session-id", "session")
+            .header("session_id", "session")
+            .header("x-session-id", "session")
+            .header("x-client-request-id", "request")
+            .header("x-session-affinity", "not-forwarded")
+            .header("connection", "X-Session-Affinity")
+            .header("openai-beta", "client-feature")
+            .header("openai-organization", "org")
+            .header("openai-project", "project")
+            .header("originator", "pi-client")
+            .header("user-agent", "pi-agent")
+            .header("x-stainless-lang", "js")
+            .header("x-stainless-package-version", "1")
+            .header("x-stainless-os", "os")
+            .header("x-stainless-arch", "arch")
+            .header("x-stainless-runtime", "node")
+            .header("x-stainless-runtime-version", "1")
+            .header("x-stainless-retry-count", "0")
+            .header("x-stainless-timeout", "60")
+            .header("x-stainless-custom", "blocked")
+            .header("x-forwarded-for", "blocked")
+            .header("forwarded", "blocked")
+            .header("x-custom", "blocked")
+            .header("content-encoding", "gzip")
+            .header("content-type", "text/plain")
+            .header("accept-encoding", "gzip")
             .body(Body::from(json!({"model":"legacy/gpt-test","instructions":"custom","input":[],"stream":true,"store":false}).to_string())).unwrap();
         let response = forward(&gateway, request, "/responses").await;
         assert_eq!(response.status(), StatusCode::OK);
