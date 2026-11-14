@@ -54,6 +54,9 @@
         {
           default = pkgs.mkShell {
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            shellHook = nixpkgs.lib.optionalString (system == "aarch64-darwin") ''
+              export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="${pkgs.stdenv.cc}/bin/cc"
+            '';
             packages = [
               pkgs.rustc
               pkgs.cargo
