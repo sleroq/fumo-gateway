@@ -56,6 +56,9 @@ impl Gateway {
             .env("TEST_UPSTREAM_KEY", "upstream-secret")
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
+        if let Some(cert_file) = std::env::var_os("SSL_CERT_FILE") {
+            command.env("SSL_CERT_FILE", cert_file);
+        }
         if let Some(proxy) = proxy {
             command.env("TEST_PROXY", proxy);
         }
