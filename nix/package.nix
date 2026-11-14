@@ -3,6 +3,7 @@
   aws-lc,
   stdenvNoCC,
   bun,
+  cacert,
   pkg-config,
   rustPlatform,
   zstd,
@@ -71,6 +72,9 @@ rustPlatform.buildRustPackage {
       --replace-fail '#!/usr/bin/env node' '#!${bun}/bin/bun'
   '';
   doCheck = true;
+  preCheck = ''
+    export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
+  '';
   __darwinAllowLocalNetworking = true;
   meta = {
     description = "Headless Responses gateway with Sign in with ChatGPT";
