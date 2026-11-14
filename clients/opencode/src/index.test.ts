@@ -1,14 +1,16 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test"
 import { Connection, Credential, Model, Plugin, Provider } from "@opencode/plugin"
+import type { OpenCodeEvent } from "@opencode/client"
+import type { SelectedEvent, SubscribeOptions } from "@opencode/client/promise/api"
 import type { ProviderEditor } from "@opencode/plugin/promise/provider"
 import type { SessionHttpRequest } from "@opencode/plugin/promise/session"
 import { Agent } from "@opencode/schema/agent"
 import { Session } from "@opencode/schema/session"
-import { LLMClient, LLMRequest, Message, ToolDefinition } from "@opencode/ai"
-import { RequestExecutor } from "@opencode/ai/route/executor"
+import { ai, AIClient } from "@opencode/ai/effect"
+import { RequestExecutor } from "@opencode/ai/route"
 import { provider } from "@opencode/ai/providers/openai-compatible-responses"
 import { OpenAICompatible } from "@opencode/ai/providers/openai-compatible"
-import { Effect, Schema, Stream } from "effect"
+import { Effect, Layer, Schema, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { parseCatalog } from "../../catalog"
 import fixture from "../../../tests/fixtures/model-catalog.json"
@@ -32,7 +34,7 @@ function events() {
   function idle() {}
   let wake: () => void = idle
   let aborted = false
-  const subscribe: FumoContext["event"]["subscribe"] = async function* (options) {
+  async function* subscribe<Type extends Exclude<OpenCodeEvent["type"], "server.connected">>(options?: SubscribeOptions<Type>): AsyncIterable<SelectedEvent<OpenCodeEvent, Type>> {
     function abort() { aborted = true; wake() }
     options?.signal?.addEventListener("abort", abort, { once: true })
     try {
@@ -40,7 +42,10 @@ function events() {
         if (!queue.length) await new Promise<void>((resolve) => { wake = resolve })
         const item = queue.shift()
         if (!item) continue
-        yield item.event
+        if (!options?.types || options.types.some((type) => type === item.event.type)) {
+          // SAFETY: The subscription either requests all events or includes this event's type.
+          yield item.event as SelectedEvent<OpenCodeEvent, Type>
+        }
         item.done()
       }
     } finally { options?.signal?.removeEventListener("abort", abort) }
@@ -148,19 +153,18 @@ async function nativeRequest(entry: typeof entries[number]) {
     baseURL, apiKey: "test-client-key",
     http: { body: { prompt_cache_options: { mode: "explicit" }, prompt_cache_retention: "24h", previous_response_id: "resp_old" } },
   }).model(entry.id)
-  const request = new LLMRequest({
+  const request = ai.request({
     model, system: [{ type: "text", text: "Be helpful" }],
-    messages: [Message.system("Updated instructions"), Message.user("Hello")],
-    tools: [new ToolDefinition({ name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } })],
-    generation: { maxTokens: 4096, temperature: 0.7, topP: 0.9 },
+    messages: [{ role: "system", content: "Updated instructions" }, { role: "user", content: "Hello" }],
+    tools: [{ name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }],
+    maxTokens: 4096, temperature: 0.7, topP: 0.9,
     providerOptions: { metadata: { test: "value" }, maxToolCalls: 2, topLogprobs: 3, truncation: "auto", reasoningEffort: "high" },
     promptCacheKey: "session-cache",
   })
   let outgoing: Request | undefined
-  await Effect.runPromise(LLMClient.stream(request).pipe(
+  await Effect.runPromise(ai.stream(request).pipe(
     Stream.runDrain,
-    Effect.provide(LLMClient.layer),
-    Effect.provideService(RequestExecutor.Service, {
+    Effect.provide(AIClient.layerWith(Layer.succeed(RequestExecutor.Service, {
       execute: (native) => Effect.gen(function* () {
         outgoing = yield* HttpClientRequest.toWeb(native).pipe(Effect.orDie)
         return HttpClientResponse.fromWeb(native, new Response(completions
@@ -168,7 +172,7 @@ async function nativeRequest(entry: typeof entries[number]) {
           : 'data: {"type":"response.completed","response":{"id":"resp_test","output":[]}}\n\n',
         { headers: { "Content-Type": "text/event-stream" } }))
       }),
-    }),
+    }))),
   ))
   if (!outgoing) throw new Error("Native transport did not send a request")
   return outgoing
